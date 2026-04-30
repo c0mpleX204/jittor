@@ -1,0 +1,45 @@
+# JittorGeometric 官方库 - 不作为自己项目代码上传
+JittorGeometric/
+
+# Claude Code 内部文件
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# 虚拟环境
+jittor-env/
+venv/
+.venv/
+
+# Jittor 缓存 (运行时生成)
+.cache/
+
+# 系统包 / 二进制文件
+*.deb
+*.rpm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 数据文件 (运行时下载)
+data/
+*.pkl
+*.pt
+*.pth
+
+# OS
+.DS_Store
+Thumbs.db
+ask.txt
+release.zip
