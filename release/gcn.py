@@ -95,10 +95,10 @@ class GCNNet(nn.Module):
 model = GCNNet(
     num_features=num_features,
     num_classes=num_classes,
-    hidden_dim=256,
-    dropout=0.8
+    hidden_dim=64,
+    dropout=0.6
 )
-optimizer = nn.Adam(params=model.parameters(), lr=0.01, weight_decay=5e-4)
+optimizer = nn.Adam(params=model.parameters(), lr=0.012, weight_decay=5e-4)
 
 # ============================================================
 # 第四步：定义训练函数
@@ -123,13 +123,10 @@ def train():
 def test():
     model.eval()
     logits = model()
+    pred, _ = jt.argmax(logits, dim=1)
     accs = []
 
     for mask in [data.train_mask, data.val_mask]:
-        # 实现预测和准确率计算
-        # 1. 使用 jt.argmax 获取预测类别
-        pred, _ = jt.argmax(logits, dim=1), None
-        # 2. 计算预测准确率
         acc = (pred[mask] == data.y[mask]).float().mean().item()
         accs.append(acc)
 
@@ -160,15 +157,16 @@ model.eval()
 
 # 1. 使用训练好的模型对所有节点进行预测
 logits = model()
-pred, _ = jt.argmax(logits, dim=1), None
+pred, _ = jt.argmax(logits, dim=1)
 
 # 2. 提取测试集节点的预测类别
 test_indices = np.where(data.test_mask.numpy())[0]
+test_pred = pred[data.test_mask].numpy()
 
 # 3. 构建字典 {节点编号: 预测类别}
 result = {}
-for idx in test_indices:
-    result[str(int(idx))] = int(pred[int(idx)])
+for idx, p in zip(test_indices, test_pred):
+    result[str(int(idx))] = int(p)
 
 # 4. 保存为 result.json
 output_path = 'result.json'
