@@ -74,8 +74,8 @@ class GCNNet(nn.Module):
 
         # 定义两层 GCN 卷积层
         # 提示：GCNConv(in_channels, out_channels)
-        self.conv1 = "TODO: 请在此处填写代码"
-        self.conv2 = "TODO: 请在此处填写代码"
+        self.conv1 = GCNConv(num_features, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, num_classes)
 
     def execute(self):
         x, csc, csr = data.x, data.csc, data.csr
@@ -84,9 +84,10 @@ class GCNNet(nn.Module):
         # 1. 第一层 GCN 卷积 + ReLU 激活
         # 2. Dropout
         # 3. 第二层 GCN 卷积
-        x = "TODO: 请在此处填写代码"
+        x = self.conv1(x, csc, csr)
+        x = nn.relu(x)
         x = nn.dropout(x, self.dropout, is_train=self.training)
-        x = "TODO: 请在此处填写代码"
+        x = self.conv2(x, csc, csr)
 
         return x
 
@@ -110,8 +111,11 @@ def train():
 
     # TODO: 实现训练逻辑的以下 2-4 步骤
     # 2. 获取训练集节点的预测值
+    truth = data.y[data.train_mask]
     # 3. 计算交叉熵损失
+    loss = nn.cross_entropy_loss(pred, truth)
     # 4. 反向传播更新参数
+    optimizer.step(loss)
 
 # ============================================================
 # 第五步：定义测试函数
@@ -124,9 +128,9 @@ def test():
     for mask in [data.train_mask, data.val_mask]:
         # 实现预测和准确率计算
         # 1. 使用 jt.argmax 获取预测类别
-        pred, _ = "TODO: 请在此处填写代码"
+        pred, _ = jt.argmax(logits, dim=1), None
         # 2. 计算预测准确率
-        acc = "TODO: 请在此处填写代码"
+        acc = (pred[mask] == data.y[mask]).float().mean().item()
         accs.append(acc)
 
     return accs
@@ -156,10 +160,10 @@ model.eval()
 
 # 1. 使用训练好的模型对所有节点进行预测
 logits = model()
-pred, _ = "TODO: 请在此处填写代码"
+pred, _ = jt.argmax(logits, dim=1), None
 
 # 2. 提取测试集节点的预测类别
-test_indices = "TODO: 请在此处填写代码"
+test_indices = np.where(data.test_mask.numpy())[0]
 
 # 3. 构建字典 {节点编号: 预测类别}
 result = {}
