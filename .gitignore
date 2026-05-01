@@ -43,3 +43,5 @@ data/
 Thumbs.db
 ask.txt
 release.zip
+
+*.zip
