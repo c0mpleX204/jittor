@@ -37,7 +37,10 @@ data/
 *.pkl
 *.pt
 *.pth
-
+!release4/starter_code/src/data/
+!release4/starter_code/src/data/*.py
+!release4/starter_code/configs/data/
+!release4/starter_code/configs/data/*.py
 # OS
 .DS_Store
 Thumbs.db
@@ -45,3 +48,5 @@ ask.txt
 release.zip
 
 *.zip
+*.gz
+*.tar
