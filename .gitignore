@@ -50,3 +50,9 @@ release.zip
 *.zip
 *.gz
 *.tar
+
+# release4 generated point-cloud comparison/evaluation artifacts
+release4/starter_code/compare/
+release4/starter_code/cc_eval*/
+release4/starter_code/score_report*/
+release4/starter_code/score_cd_p2s_report/
