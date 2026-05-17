@@ -15,11 +15,31 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
 
 
+def _is_allowed_delete_target(target: Path) -> bool:
+    roots = [Path.cwd().resolve(), Path("/root/autodl-tmp").resolve()]
+    return any(target != root and root in target.parents for root in roots)
+
+
+def _clear_dir(path: Path) -> None:
+    for child in path.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def safe_rmtree(path: Path) -> None:
+    if path.is_symlink():
+        target = path.resolve()
+        if not _is_allowed_delete_target(target):
+            raise ValueError(f"Refuse to clear symlink target: {target}")
+        if target.exists():
+            _clear_dir(target)
+        return
+
     target = path.resolve()
-    root = Path.cwd().resolve()
-    if target == root or root not in target.parents:
-        raise ValueError(f"Refuse to delete outside current workspace: {target}")
+    if not _is_allowed_delete_target(target):
+        raise ValueError(f"Refuse to delete outside allowed workspace/data disk: {target}")
     if target.exists():
         shutil.rmtree(target)
 

@@ -1,0 +1,4 @@
+__target__: vm
+
+ckpt_save_dir: /root/autodl-tmp/jittor_pcd/experiments/vm
+ckpt_save_name: checkpoint
