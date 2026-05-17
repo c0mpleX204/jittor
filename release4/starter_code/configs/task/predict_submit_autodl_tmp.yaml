@@ -1,0 +1,14 @@
+mode: predict
+debug: False
+load_ckpt: /root/autodl-tmp/jittor_pcd/experiments/vm/checkpoint_99.pkl
+
+components:
+  data: predict
+  transform: predict_npy
+  system: vm
+  model: vm
+
+writer:
+  __target__: vm
+  save_dir: /root/autodl-tmp/jittor_pcd/submit_result_raw
+  save_name: denoised
