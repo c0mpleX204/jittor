@@ -88,8 +88,17 @@ def main() -> None:
         raise ValueError(f"No keys found in {args.list}")
 
     copied = 0
+    missing = []
+    multiple = []
     for key in keys:
-        src = find_prediction(args.raw_dir, key, args.filename, args.input_prefix)
+        try:
+            src = find_prediction(args.raw_dir, key, args.filename, args.input_prefix)
+        except FileNotFoundError:
+            missing.append(key)
+            continue
+        except RuntimeError as exc:
+            multiple.append(str(exc))
+            continue
         dst = args.out_dir / key / args.filename
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
@@ -97,6 +106,20 @@ def main() -> None:
 
     print(f"Collected predictions: {copied}")
     print(f"Output dir: {args.out_dir.resolve()}")
+    if missing or multiple:
+        if missing:
+            print(f"Missing predictions: {len(missing)}")
+            for key in missing[:20]:
+                print(f"  missing: {key}")
+        if multiple:
+            print(f"Ambiguous predictions: {len(multiple)}")
+            for msg in multiple[:20]:
+                print(f"  {msg}")
+        raw_count = len(list(args.raw_dir.rglob(args.filename))) if args.raw_dir.exists() else 0
+        raise SystemExit(
+            f"Collect failed: copied={copied}, expected={len(keys)}, raw_files={raw_count}, "
+            f"raw_dir={args.raw_dir}"
+        )
 
 
 if __name__ == "__main__":

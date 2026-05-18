@@ -98,12 +98,30 @@ def main() -> None:
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
-    if args.overwrite:
-        safe_rmtree(args.result_dir)
     score_dir = args.result_dir / "scores"
     vis_dir = args.result_dir / "visualization"
+    if args.overwrite:
+        safe_rmtree(score_dir)
+        safe_rmtree(vis_dir)
+    args.result_dir.mkdir(parents=True, exist_ok=True)
     score_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(parents=True, exist_ok=True)
+
+    gt_samples = find_samples(args.gt_dir, "clean.npy")
+    noisy_samples = find_samples(args.noisy_dir, "noisy.npy")
+    pred_samples = find_samples(args.pred_dir, "denoised.npy")
+    common_keys = sorted(set(gt_samples) & set(noisy_samples) & set(pred_samples))
+    if not common_keys:
+        raise RuntimeError(
+            "No matching samples before scoring. "
+            f"pred={len(pred_samples)}, noisy={len(noisy_samples)}, gt={len(gt_samples)}. "
+            f"Check --pred-dir: {args.pred_dir}"
+        )
+    print(
+        "Pre-score sample counts: "
+        f"pred={len(pred_samples)}, noisy={len(noisy_samples)}, gt={len(gt_samples)}, "
+        f"common={len(common_keys)}"
+    )
 
     score_cmd = [
         sys.executable,
@@ -127,12 +145,8 @@ def main() -> None:
         print("Visualization skipped.")
         return
 
-    gt_samples = find_samples(args.gt_dir, "clean.npy")
-    noisy_samples = find_samples(args.noisy_dir, "noisy.npy")
-    pred_samples = find_samples(args.pred_dir, "denoised.npy")
-    keys = sorted(set(gt_samples) & set(noisy_samples) & set(pred_samples))
     sample_list = read_list(args.sample_list)
-    visual_keys = choose_visual_keys(keys, sample_list, args.visualize_count)
+    visual_keys = choose_visual_keys(common_keys, sample_list, args.visualize_count)
 
     for key in visual_keys:
         mesh = mesh_path(args.mesh_dir, key, args.mesh_name)

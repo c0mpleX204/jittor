@@ -245,6 +245,12 @@ def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_
     for pidx in range(N):
         patch_id = best_weights_idx[pidx].item()
         mask = (point_idxs[patch_id] == pidx)
-        pcl_out.append(patches_denoised[patch_id][mask])
+        if mask.sum().item() > 0:
+            pcl_out.append(patches_denoised[patch_id][mask][:1])
+        else:
+            # Rarely, FPS+KNN patches do not cover every point. Keep the original
+            # noisy point so inference always preserves the competition point count.
+            pcl_out.append(pcl_noisy[0, pidx:pidx+1])
     pcl_out = jt.concat(pcl_out, dim=0)
+    assert pcl_out.shape[0] == N, f"denoised point count mismatch: {pcl_out.shape[0]} != {N}"
     return pcl_out
