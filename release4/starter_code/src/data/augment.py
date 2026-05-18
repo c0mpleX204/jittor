@@ -10,6 +10,45 @@ from .asset import Asset
 from .spec import ConfigSpec
 from .utils import random_euler_rotation, sample_vertex_groups
 
+
+def _as_tuple(x):
+    if x is None:
+        return None
+    if isinstance(x, tuple):
+        return x
+    if isinstance(x, list):
+        return tuple(x)
+    return (x,)
+
+
+def _choose_noise_type(noise_types, noise_probs=None) -> str:
+    noise_types = _as_tuple(noise_types)
+    assert noise_types is not None and len(noise_types) > 0
+    if noise_probs is None:
+        idx = np.random.randint(len(noise_types))
+        return noise_types[idx]
+    noise_probs = np.asarray(_as_tuple(noise_probs), dtype=np.float64)
+    assert len(noise_probs) == len(noise_types)
+    noise_probs = noise_probs / noise_probs.sum()
+    idx = np.random.choice(len(noise_types), p=noise_probs)
+    return noise_types[idx]
+
+
+def _sample_noise(noise_type: str, scale, shape):
+    if noise_type == "laplace":
+        return np.random.laplace(0, scale, size=shape)
+    if noise_type == "gaussian":
+        return np.random.normal(0, scale, size=shape)
+    if noise_type == "uniform":
+        half_width = np.sqrt(3.0) * scale
+        return np.random.uniform(-half_width, half_width, size=shape)
+    raise ValueError(f"unsupported noise_type: {noise_type}")
+
+
+def _ensure_noisy_if_missing(asset: Asset, pc):
+    if asset.sampled_vertices_noisy is None:
+        asset.sampled_vertices_noisy = pc.copy()
+
 @dataclass(frozen=True)
 class Augment(ConfigSpec):
     
@@ -69,6 +108,10 @@ class AugmentAddNoise(Augment):
     noise_std_min: float
     
     noise_std_max: float
+
+    noise_type: str="laplace"
+
+    enabled: bool=True
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentAddNoise':
@@ -78,9 +121,140 @@ class AugmentAddNoise(Augment):
     def apply(self, asset: Asset, **kwargs):
         pc = asset.sampled_vertices
         assert pc is not None, "sampled_vertices is None, cannot apply AugmentAddNoise"
+        if not self.enabled:
+            _ensure_noisy_if_missing(asset, pc)
+            return
         noise_std = np.random.uniform(self.noise_std_min, self.noise_std_max)
-        noise = np.random.laplace(0, noise_std, size=pc.shape)
+        noise = _sample_noise(self.noise_type, noise_std, pc.shape)
         asset.sampled_vertices_noisy = pc + noise
+
+@dataclass(frozen=True)
+class AugmentAddMixedNoise(Augment):
+    
+    noise_std_min: float
+    
+    noise_std_max: float
+    
+    noise_types: Tuple[str, ...]=("laplace", "gaussian")
+    
+    noise_probs: Optional[Tuple[float, ...]]=None
+    
+    enabled: bool=True
+    
+    @classmethod
+    def parse(cls, **kwargs) -> 'AugmentAddMixedNoise':
+        cls.check_keys(kwargs)
+        kwargs = deepcopy(kwargs)
+        if "noise_types" in kwargs:
+            kwargs["noise_types"] = _as_tuple(kwargs["noise_types"])
+        if kwargs.get("noise_probs") is not None:
+            kwargs["noise_probs"] = _as_tuple(kwargs["noise_probs"])
+        return AugmentAddMixedNoise(**kwargs)
+    
+    def apply(self, asset: Asset, **kwargs):
+        pc = asset.sampled_vertices
+        assert pc is not None, "sampled_vertices is None, cannot apply AugmentAddMixedNoise"
+        if not self.enabled:
+            _ensure_noisy_if_missing(asset, pc)
+            return
+        noise_type = _choose_noise_type(self.noise_types, self.noise_probs)
+        noise_std = np.random.uniform(self.noise_std_min, self.noise_std_max)
+        noise = _sample_noise(noise_type, noise_std, pc.shape)
+        asset.sampled_vertices_noisy = pc + noise
+
+@dataclass(frozen=True)
+class AugmentAddNonUniformNoise(Augment):
+    
+    noise_std_min: float
+    
+    noise_std_max: float
+    
+    noise_type: str="laplace"
+    
+    num_centers_min: int=1
+    
+    num_centers_max: int=4
+    
+    radius_min: float=0.08
+    
+    radius_max: float=0.25
+    
+    enabled: bool=True
+    
+    @classmethod
+    def parse(cls, **kwargs) -> 'AugmentAddNonUniformNoise':
+        cls.check_keys(kwargs)
+        return AugmentAddNonUniformNoise(**kwargs)
+    
+    def apply(self, asset: Asset, **kwargs):
+        pc = asset.sampled_vertices
+        assert pc is not None, "sampled_vertices is None, cannot apply AugmentAddNonUniformNoise"
+        if not self.enabled:
+            _ensure_noisy_if_missing(asset, pc)
+            return
+        
+        N = pc.shape[0]
+        num_centers = np.random.randint(self.num_centers_min, self.num_centers_max + 1)
+        center_idx = np.random.choice(N, size=min(num_centers, N), replace=False)
+        radius = np.random.uniform(self.radius_min, self.radius_max)
+        
+        weights = np.zeros((N,), dtype=np.float64)
+        for idx in center_idx:
+            dist2 = ((pc - pc[idx]) ** 2).sum(axis=1)
+            weights = np.maximum(weights, np.exp(-dist2 / (2.0 * radius * radius + 1e-12)))
+        
+        scales = self.noise_std_min + (self.noise_std_max - self.noise_std_min) * weights
+        noise = _sample_noise(self.noise_type, scales[:, None], pc.shape)
+        asset.sampled_vertices_noisy = pc + noise
+
+@dataclass(frozen=True)
+class AugmentAddLocalStrongNoise(Augment):
+    
+    noise_std_min: float
+    
+    noise_std_max: float
+    
+    noise_type: str="laplace"
+    
+    num_centers_min: int=1
+    
+    num_centers_max: int=4
+    
+    radius_min: float=0.05
+    
+    radius_max: float=0.15
+    
+    enabled: bool=True
+    
+    @classmethod
+    def parse(cls, **kwargs) -> 'AugmentAddLocalStrongNoise':
+        cls.check_keys(kwargs)
+        return AugmentAddLocalStrongNoise(**kwargs)
+    
+    def apply(self, asset: Asset, **kwargs):
+        pc = asset.sampled_vertices
+        assert pc is not None, "sampled_vertices is None, cannot apply AugmentAddLocalStrongNoise"
+        if not self.enabled:
+            _ensure_noisy_if_missing(asset, pc)
+            return
+        
+        noisy = asset.sampled_vertices_noisy.copy() if asset.sampled_vertices_noisy is not None else pc.copy()
+        N = pc.shape[0]
+        num_centers = np.random.randint(self.num_centers_min, self.num_centers_max + 1)
+        center_idx = np.random.choice(N, size=min(num_centers, N), replace=False)
+        tree = cKDTree(pc)
+        
+        mask = np.zeros((N,), dtype=bool)
+        for idx in center_idx:
+            radius = np.random.uniform(self.radius_min, self.radius_max)
+            nn_idx = tree.query_ball_point(pc[idx], r=radius)
+            mask[nn_idx] = True
+        
+        if mask.any():
+            noise_std = np.random.uniform(self.noise_std_min, self.noise_std_max)
+            noise = _sample_noise(self.noise_type, noise_std, pc.shape)
+            noisy[mask] = noisy[mask] + noise[mask]
+        asset.sampled_vertices_noisy = noisy
 
 @dataclass(frozen=True)
 class AugmentLinear(Augment):
@@ -178,6 +352,9 @@ def get_augments(*args) -> List[Augment]:
         "sample": AugmentSample,
         "normalize_pc": AugmentNormalizePC,
         "add_noise": AugmentAddNoise,
+        "mixed_noise": AugmentAddMixedNoise,
+        "nonuniform_noise": AugmentAddNonUniformNoise,
+        "local_strong_noise": AugmentAddLocalStrongNoise,
         "linear": AugmentLinear,
         "patch": AugmentPatch,
     }

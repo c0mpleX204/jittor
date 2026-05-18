@@ -1,0 +1,78 @@
+train_transform:
+  augments:
+    - __target__: sample
+      num_samples: 32768
+      num_vertex_samples: 1024
+
+    - __target__: normalize_pc
+
+    # Switch: enable only one primary noise at a time.
+    # Baseline Laplace noise.
+    - __target__: add_noise
+      enabled: False
+      noise_type: laplace
+      noise_std_min: 0.005
+      noise_std_max: 0.020
+
+    # Mixed noise: randomly choose Laplace / Gaussian for each sample.
+    - __target__: mixed_noise
+      enabled: True
+      noise_types: [laplace, gaussian]
+      noise_probs: [0.5, 0.5]
+      noise_std_min: 0.005
+      noise_std_max: 0.020
+
+    # Non-uniform noise: different regions have different noise strength.
+    - __target__: nonuniform_noise
+      enabled: False
+      noise_type: laplace
+      noise_std_min: 0.003
+      noise_std_max: 0.025
+      num_centers_min: 1
+      num_centers_max: 4
+      radius_min: 0.08
+      radius_max: 0.25
+
+    # Local strong noise: add extra stronger noise to several local regions.
+    # It can be stacked on top of a primary noise by setting enabled: True.
+    - __target__: local_strong_noise
+      enabled: False
+      noise_type: laplace
+      noise_std_min: 0.015
+      noise_std_max: 0.040
+      num_centers_min: 1
+      num_centers_max: 3
+      radius_min: 0.04
+      radius_max: 0.12
+
+    - __target__: linear
+      scale: [0.8, 1.2]
+      rotate_x_range: [-180, 180]
+      rotate_y_range: [-180, 180]
+      rotate_z_range: [-180, 180]
+      scale_p: 0.5
+      rotate_p: 0.5
+
+    - __target__: patch
+      patch_size: 1000
+      num_patches: 1
+      train_cvm_network: False
+
+validate_transform: &validate_transform
+  augments:
+    - __target__: sample
+      num_samples: 32768
+      num_vertex_samples: 1024
+
+    - __target__: normalize_pc
+
+    - __target__: add_noise
+      noise_std_min: 0.005
+      noise_std_max: 0.020
+
+    - __target__: patch
+      patch_size: 1000
+      num_patches: 1
+      train_cvm_network: False
+
+predict_transform: *validate_transform
