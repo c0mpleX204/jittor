@@ -4,11 +4,11 @@ load_ckpt: experiments/vm/checkpoint_99.pkl
 
 components:
   data: predict
-  transform: vm
+  transform: predict_npy
   system: vm
   model: vm
 
 writer:
   __target__: vm
-  save_dir: tmp_predict
-  save_name: predict
+  save_dir: tmp_predict_vm
+  save_name: denoised
