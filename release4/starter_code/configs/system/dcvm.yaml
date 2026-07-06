@@ -1,0 +1,4 @@
+__target__: vm
+
+ckpt_save_dir: experiments/dcvm
+ckpt_save_name: checkpoint
