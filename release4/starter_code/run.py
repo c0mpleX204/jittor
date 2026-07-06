@@ -14,6 +14,7 @@ from src.data.asset import Asset, Exporter
 from src.data.dataset import DatasetConfig, DatasetConfig, PCDatasetModule
 from src.data.transform import Transform
 from src.model.parse import get_model
+from src.system.spec import load_model_state
 from src.system.parse import get_system, get_writer
 
 def load(task: str, path: str) -> Dict:
@@ -103,11 +104,18 @@ if __name__ == "__main__":
     loss_config = task.get('loss', None)
     trainer_config = task.get('trainer', None)
     
-    # load ckpt
+    # load_ckpt is a model-only warm start. resume_ckpt restores model,
+    # optimizer, rng state, and epoch after the system is created.
     load_ckpt = task.get('load_ckpt', None)
+    resume_ckpt = task.get('resume_ckpt', None)
+    if resume_ckpt is None and trainer_config is not None:
+        resume_ckpt = trainer_config.get('resume_ckpt', None)
     
+    if load_ckpt is not None and resume_ckpt is not None:
+        raise ValueError("Use only one of load_ckpt or resume_ckpt, not both.")
+
     if load_ckpt is not None and model is not None:
-        model.load(load_ckpt)
+        load_model_state(model, load_ckpt)
     
     # get writer
     writer_config = task.get('writer', None)
@@ -127,6 +135,10 @@ if __name__ == "__main__":
         )
     else:
         system = None
+
+    if resume_ckpt is not None:
+        assert system is not None, "system is None, cannot resume"
+        system.load_training_checkpoint(resume_ckpt)
     
     if mode == 'debug':
         debug_fn(data=dataset_module)
