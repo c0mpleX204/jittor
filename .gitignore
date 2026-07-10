@@ -1,10 +1,4 @@
-# JittorGeometric 官方库 - 不作为自己项目代码上传
-JittorGeometric/
-
-# Claude Code 内部文件
-.claude/
-
-# Python
+# Python caches and build artifacts
 __pycache__/
 *.py[cod]
 *.pyo
@@ -14,42 +8,49 @@ build/
 *.egg
 .eggs/
 
-# 虚拟环境
+# Virtual environments
 jittor-env/
 venv/
 .venv/
 
-# Jittor 缓存 (运行时生成)
+# Tooling / editor state
+.claude/
 .cache/
-
-# 系统包 / 二进制文件
-*.deb
-*.rpm
-
-# IDE
+.pytest_cache/
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# 数据文件 (运行时下载)
-data/
-*.pkl
-*.pt
-*.pth
-!release4/starter_code/src/data/
-!release4/starter_code/src/data/*.py
-!release4/starter_code/configs/data/
-!release4/starter_code/configs/data/*.py
-# OS
 .DS_Store
 Thumbs.db
-ask.txt
-release.zip
 
+# Packages and generated archives
+*.deb
+*.rpm
 *.zip
 *.gz
 *.tar
+*.tar.gz
+release.zip
+
+# Datasets and generated experiment artifacts
+/data/
+/release2/data/
+dataset_train/
+dataset_test_noisy/
+true_test/
+noisy_test/
+outputs/
+results/
+experiments/
+data_out/
+*.log
+*.pkl
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
 
 # release4 generated point-cloud comparison/evaluation artifacts
 release4/starter_code/compare/
