@@ -13,29 +13,16 @@ from ..data.asset import Asset
 class PointDecoder(nn.Module):
     def __init__(self, z_dim: int, out_dim: int, hidden_size: int):
         super().__init__()
-        self.lin_1 = nn.Linear(z_dim, z_dim)
-        self.bn_1_out = nn.BatchNorm1d(z_dim)
-
-        self.lin_2 = nn.Linear(z_dim, hidden_size)
-        self.bn_2_out = nn.BatchNorm1d(hidden_size)
-
-        self.lin_3 = nn.Linear(hidden_size, out_dim)
-
-        self.actvn_out = nn.ReLU()
-        self.dropout = nn.Dropout(0.1)
+        self.net = nn.Sequential(
+            nn.Linear(z_dim, z_dim),
+            nn.ReLU(),
+            nn.Linear(z_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, out_dim),
+        )
 
     def execute(self, c):
-        net = self.lin_1(c)
-        net = self.bn_1_out(net)
-        net = self.actvn_out(net)
-        net = self.dropout(net)
-
-        net = self.lin_2(net)
-        net = self.bn_2_out(net)
-        net = self.actvn_out(net)
-        net = self.dropout(net)
-
-        return self.lin_3(net)
+        return self.net(c)
 
 
 class DirectionDistanceVelocityModule(ModelSpec):
@@ -46,11 +33,8 @@ class DirectionDistanceVelocityModule(ModelSpec):
         self.frame_knn = cfg["frame_knn"]
         self.num_train_points = cfg["num_train_points"]
         self.dsm_sigma = cfg["dsm_sigma"]
-        self.eps = cfg.get("eps", 1e-8)
 
-        self.delta_loss_weight = cfg.get("delta_loss_weight", 1.0)
-        self.direction_loss_weight = cfg.get("direction_loss_weight", 0.1)
-        self.distance_loss_weight = cfg.get("distance_loss_weight", 0.2)
+        self.velocity_max = cfg.get("velocity_max", 0.15)
         self.predict_step_scale = cfg.get("predict_step_scale", 1.0)
 
         self.encoder = FeatureExtraction(
@@ -59,41 +43,24 @@ class DirectionDistanceVelocityModule(ModelSpec):
             embedding_dim=cfg["feat_embedding_dim"],
         )
 
-        self.direction_decoder = PointDecoder(
+        self.decoder = PointDecoder(
             z_dim=self.encoder.embedding_dim,
-            out_dim=3,
+            out_dim=4,
             hidden_size=cfg["decoder_hidden_dim"],
         )
-        self.distance_decoder = PointDecoder(
-            z_dim=self.encoder.embedding_dim,
-            out_dim=1,
-            hidden_size=cfg["decoder_hidden_dim"],
-        )
-
-    def _normalize_direction(self, raw_direction):
-        norm = jt.sqrt((raw_direction ** 2.0).sum(dim=-1, keepdims=True) + self.eps)
-        return raw_direction / norm
-
-    def _positive_distance(self, raw_distance):
-        return jt.sqrt(raw_distance ** 2.0 + self.eps)
 
     def _predict_delta_from_feat(self, feat, B: int, N: int):
         F_dim = feat.shape[-1]
-        feat_flat = feat.reshape(-1, F_dim)
-
-        pred_direction = self._normalize_direction(
-            self.direction_decoder(feat_flat).reshape(B, N, 3)
-        )
-        pred_distance = self._positive_distance(
-            self.distance_decoder(feat_flat).reshape(B, N, 1)
-        )
-        pred_delta = pred_direction * pred_distance
-        return pred_delta, pred_direction, pred_distance
+        pred = self.decoder(feat.reshape(-1, F_dim)).reshape(B, N, 4)
+        velocity = jt.tanh(pred[:, :, :3]) * self.velocity_max
+        gate = jt.sigmoid(pred[:, :, 3:4])
+        pred_delta = velocity * gate
+        return pred_delta
 
     def get_supervised_loss(self, pc_current, pc_clean):
         """
-        Learn the remaining displacement from the current noisy/mixed state to
-        the clean surface as direction * distance.
+        Learn a single bounded displacement from the current noisy/mixed state
+        toward the clean surface.
         """
         B, N, _ = pc_current.shape
         pnt_idx = get_random_indices(N, self.num_train_points)
@@ -104,25 +71,13 @@ class DirectionDistanceVelocityModule(ModelSpec):
         pc_clean = pc_clean[:, pnt_idx, :]
 
         target_delta = pc_clean - pc_current
-        target_distance = jt.sqrt((target_delta ** 2.0).sum(dim=-1, keepdims=True) + self.eps)
-        target_direction = target_delta / target_distance
-
-        pred_delta, pred_direction, pred_distance = self._predict_delta_from_feat(
+        pred_delta = self._predict_delta_from_feat(
             feat=feat,
             B=B,
             N=len(pnt_idx),
         )
 
-        delta_loss = (((pred_delta - target_delta) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
-        direction_loss = (1.0 - (pred_direction * target_direction).sum(dim=-1)).mean()
-        distance_loss = (((pred_distance - target_distance) ** 2.0) / self.dsm_sigma).mean()
-
-        loss = (
-            self.delta_loss_weight * delta_loss
-            + self.direction_loss_weight * direction_loss
-            + self.distance_loss_weight * distance_loss
-        )
-        return loss
+        return (((pred_delta - target_delta) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
 
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=1):
         """
@@ -133,7 +88,7 @@ class DirectionDistanceVelocityModule(ModelSpec):
             pcl_next = pcl_noisy.clone()
             for _ in range(num_steps):
                 feat = self.encoder(pcl_next)
-                pred_delta, _, _ = self._predict_delta_from_feat(feat=feat, B=B, N=N)
+                pred_delta = self._predict_delta_from_feat(feat=feat, B=B, N=N)
                 pcl_next = pcl_next + (self.predict_step_scale / num_steps) * pred_delta
         return pcl_next, None
 
