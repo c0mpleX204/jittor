@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 import jittor as jt
 import os
+import time
 
 from ..data.asset import Asset
 from ..data.dataset import PCDatasetModule
@@ -14,6 +15,21 @@ def _get_item(x):
     if isinstance(x, jt.Var):
         return x.item()
     return x
+
+def _sync_jittor():
+    if hasattr(jt, "sync_all"):
+        jt.sync_all()
+
+def _format_seconds(seconds):
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 def get_optimizer(optimizer_config, model):
     __target__ = optimizer_config.pop('__target__')
@@ -148,12 +164,15 @@ class DummySystem():
         assert self.optimizer is not None, "optimizer is None, cannot train"
         self.model.set_predict(False)
         for epoch in range(self.epochs):
+            epoch_start_time = time.time()
             self.model.train()
             self.on_train_epoch_start()
             train_dataloader = self.dataset_module.train_dataloader()
             assert train_dataloader is not None, "train_dataloader is None"
             pbar = tqdm(train_dataloader, total=len(train_dataloader)//train_dataloader.batch_size) # type: ignore
+            train_batch_count = 0
             for batch in pbar:
+                train_batch_count += 1
                 self.on_train_batch_start()
                 loss = self.training_step(batch)
                 self.optimizer.zero_grad()
@@ -163,15 +182,26 @@ class DummySystem():
                 self.optimizer.step()
                 self.on_train_batch_end()
             self.on_train_epoch_end()
+            _sync_jittor()
+            train_elapsed = time.time() - epoch_start_time
+            avg_batch_time = train_elapsed / max(train_batch_count, 1)
+            print(
+                f"[Epoch {epoch}] train time: {_format_seconds(train_elapsed)} "
+                f"({avg_batch_time:.2f}s/batch, {train_batch_count} batches)",
+                flush=True,
+            )
             
             self.model.eval()
             validate_dataloader = self.dataset_module.validate_dataloader()
+            validate_start_time = time.time()
+            validate_batch_count = 0
             if validate_dataloader is not None:
                 self.on_validation_epoch_start()
                 if isinstance(validate_dataloader, dict):
                     for name, dataloader in validate_dataloader.items():
                         pbar = tqdm(dataloader, total=len(dataloader)//dataloader.batch_size)
                         for batch in pbar:
+                            validate_batch_count += 1
                             self.on_validation_batch_start()
                             loss = self.validation_step(batch)
                             pbar.set_description(f"Epoch {epoch}, Validate {name}, Loss: {_get_item(loss)}")
@@ -179,15 +209,26 @@ class DummySystem():
                 else:
                     pbar = tqdm(validate_dataloader, total=len(validate_dataloader)//validate_dataloader.batch_size)
                     for batch in pbar:
+                        validate_batch_count += 1
                         self.on_validation_batch_start()
                         loss = self.validation_step(batch)
                         pbar.set_description(f"Epoch {epoch}, Validate, Loss: {_get_item(loss)}")
                         self.on_validation_batch_end()
                 self.on_validation_epoch_end()
+                _sync_jittor()
+                validate_elapsed = time.time() - validate_start_time
+                print(
+                    f"[Epoch {epoch}] validate time: {_format_seconds(validate_elapsed)} "
+                    f"({validate_batch_count} batches)",
+                    flush=True,
+                )
             
             checkpoint_path = os.path.join(self.ckpt_save_dir, f'{self.ckpt_save_name}_{epoch}.pkl')
             os.makedirs(self.ckpt_save_dir, exist_ok=True)
             self.model.save(checkpoint_path)
+            _sync_jittor()
+            epoch_elapsed = time.time() - epoch_start_time
+            print(f"[Epoch {epoch}] total time: {_format_seconds(epoch_elapsed)}", flush=True)
     
     def predict(self):
         # only iterate once
