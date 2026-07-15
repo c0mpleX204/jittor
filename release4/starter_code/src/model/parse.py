@@ -1,10 +1,12 @@
 from .spec import ModelSpec
 from .dcvm import DirectionDistanceVelocityModule
+from .dcvm_v2 import SurfaceTargetVelocityModule
 from .vm import VelocityModule
 
 def get_model(model_config, **kwargs) -> ModelSpec:
     MAP = {
         'DirectionDistanceVelocityModule': DirectionDistanceVelocityModule,
+        'SurfaceTargetVelocityModule': SurfaceTargetVelocityModule,
         'VelocityModule': VelocityModule,
     }
     __target__ = model_config['__target__']
