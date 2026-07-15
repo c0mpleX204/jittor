@@ -163,12 +163,13 @@ class DummySystem():
     def train(self):
         assert self.optimizer is not None, "optimizer is None, cannot train"
         self.model.set_predict(False)
+        train_dataloader = self.dataset_module.train_dataloader()
+        assert train_dataloader is not None, "train_dataloader is None"
+        validate_dataloader = self.dataset_module.validate_dataloader()
         for epoch in range(self.epochs):
             epoch_start_time = time.time()
             self.model.train()
             self.on_train_epoch_start()
-            train_dataloader = self.dataset_module.train_dataloader()
-            assert train_dataloader is not None, "train_dataloader is None"
             pbar = tqdm(train_dataloader, total=len(train_dataloader)//train_dataloader.batch_size) # type: ignore
             train_batch_count = 0
             for batch in pbar:
@@ -192,7 +193,6 @@ class DummySystem():
             )
             
             self.model.eval()
-            validate_dataloader = self.dataset_module.validate_dataloader()
             validate_start_time = time.time()
             validate_batch_count = 0
             if validate_dataloader is not None:
