@@ -205,9 +205,6 @@ def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_
     seed_pnts, seed_idx = farthest_point_sampling(pcl_noisy, num_patches)
     patch_dists, point_idxs, patches = knn_points(seed_pnts, pcl_noisy, patch_size)
     
-    from ..data.asset import Exporter
-    pts = patches[0].reshape(-1, 3).detach().numpy()
-    
     patches = patches[0]              # (P, M, 3)
     patch_dists = patch_dists[0]      # (P, M)
     point_idxs = point_idxs[0]        # (P, M)

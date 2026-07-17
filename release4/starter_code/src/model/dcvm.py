@@ -1,31 +1,24 @@
 from typing import Dict, List
 
 import jittor as jt
-from jittor import nn
 
-from .feature import FeatureExtraction
+from .feature import Decoder, FeatureExtraction
 from .spec import ModelSpec
 from .vm import get_random_indices, patch_based_denoise
 
 from ..data.asset import Asset
 
 
-class PointDecoder(nn.Module):
-    def __init__(self, z_dim: int, out_dim: int, hidden_size: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(z_dim, z_dim),
-            nn.ReLU(),
-            nn.Linear(z_dim, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, out_dim),
-        )
-
-    def execute(self, c):
-        return self.net(c)
-
-
 class DirectionDistanceVelocityModule(ModelSpec):
+    """
+    Surface-Straight VM.
+
+    This replaces the failed v1 gated single-step delta with the VM stage from
+    StraightPCF: features are extracted from an interpolated current patch, but
+    the target is the fixed straight velocity from the high-noise endpoint to
+    the surface endpoint prepared by the transform.
+    """
+
     def __init__(self, model_config, transform_config):
         super().__init__(model_config, transform_config)
 
@@ -33,9 +26,7 @@ class DirectionDistanceVelocityModule(ModelSpec):
         self.frame_knn = cfg["frame_knn"]
         self.num_train_points = cfg["num_train_points"]
         self.dsm_sigma = cfg["dsm_sigma"]
-
-        self.velocity_max = cfg.get("velocity_max", 0.15)
-        self.predict_step_scale = cfg.get("predict_step_scale", 1.0)
+        self.denoise_steps = cfg.get("denoise_steps", 4)
 
         self.encoder = FeatureExtraction(
             k=self.frame_knn,
@@ -43,66 +34,67 @@ class DirectionDistanceVelocityModule(ModelSpec):
             embedding_dim=cfg["feat_embedding_dim"],
         )
 
-        self.decoder = PointDecoder(
+        self.decoder = Decoder(
             z_dim=self.encoder.embedding_dim,
-            out_dim=4,
+            dim=3,
+            out_dim=3,
             hidden_size=cfg["decoder_hidden_dim"],
         )
 
-    def _predict_delta_from_feat(self, feat, B: int, N: int):
-        F_dim = feat.shape[-1]
-        pred = self.decoder(feat.reshape(-1, F_dim)).reshape(B, N, 4)
-        velocity = jt.tanh(pred[:, :, :3]) * self.velocity_max
-        gate = jt.sigmoid(pred[:, :, 3:4])
-        pred_delta = velocity * gate
-        return pred_delta
-
-    def get_supervised_loss(self, pc_current, pc_clean):
+    def get_supervised_loss(self, pc_noisy_l2, pc_current, pc_surface):
         """
-        Learn a single bounded displacement from the current noisy/mixed state
-        toward the clean surface.
+        pc_noisy_l2: high-noise endpoint, equivalent to StraightPCF pcl_noisy_L2.
+        pc_current: t * pc_surface + (1 - t) * pc_noisy_l2.
+        pc_surface: nearest sampled surface endpoint.
         """
-        B, N, _ = pc_current.shape
+        B, N, d = pc_current.shape
         pnt_idx = get_random_indices(N, self.num_train_points)
 
         feat = self.encoder(pc_current)
+        F_dim = feat.shape[-1]
         feat = feat[:, pnt_idx, :]
-        pc_current = pc_current[:, pnt_idx, :]
-        pc_clean = pc_clean[:, pnt_idx, :]
+        pc_noisy_l2 = pc_noisy_l2[:, pnt_idx, :]
+        pc_surface = pc_surface[:, pnt_idx, :]
 
-        target_delta = pc_clean - pc_current
-        pred_delta = self._predict_delta_from_feat(
-            feat=feat,
-            B=B,
-            N=len(pnt_idx),
-        )
+        target_velocity = pc_surface - pc_noisy_l2
+        pred_velocity = self.decoder(
+            c=feat.reshape(-1, F_dim)
+        ).reshape(B, len(pnt_idx), d)
 
-        return (((pred_delta - target_delta) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
+        return (((pred_velocity - target_velocity) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
 
-    def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=1):
+    def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=None):
         """
         pcl_noisy: (B, N, 3)
         """
-        B, N, _ = pcl_noisy.shape
+        B, N, d = pcl_noisy.shape
+        if num_steps is None:
+            num_steps = self.denoise_steps
+
         with jt.no_grad():
             pcl_next = pcl_noisy.clone()
             for _ in range(num_steps):
                 feat = self.encoder(pcl_next)
-                pred_delta = self._predict_delta_from_feat(feat=feat, B=B, N=N)
-                pcl_next = pcl_next + (self.predict_step_scale / num_steps) * pred_delta
+                F_dim = feat.shape[-1]
+                pred_velocity = self.decoder(
+                    c=feat.reshape(-1, F_dim)
+                ).reshape(B, N, d)
+                pcl_next = pcl_next + (1.0 / num_steps) * pred_velocity
         return pcl_next, None
 
     def training_step(self, batch: Dict) -> Dict:
         patch_size = batch["pc_mix"].shape[-2]
-        pc_mix = batch["pc_mix"].reshape(-1, patch_size, 3)
-        pc_clean = batch["pc_clean"].reshape(-1, patch_size, 3)
+        pc_noisy_l2 = batch["pc_noisy"].reshape(-1, patch_size, 3)
+        pc_current = batch["pc_mix"].reshape(-1, patch_size, 3)
+        pc_surface = batch["pc_clean"].reshape(-1, patch_size, 3)
         loss = self.get_supervised_loss(
-            pc_current=pc_mix,
-            pc_clean=pc_clean,
+            pc_noisy_l2=pc_noisy_l2,
+            pc_current=pc_current,
+            pc_surface=pc_surface,
         )
         return {"loss": loss}
 
-    def execute(self, **kwargs) -> Dict: # type: ignore
+    def execute(self, **kwargs) -> Dict:  # type: ignore
         return self.training_step(**kwargs)
 
     @jt.no_grad()
@@ -113,7 +105,7 @@ class DirectionDistanceVelocityModule(ModelSpec):
         res = []
         for pc_noisy in pc_noisy_batch:
             pc_next = patch_based_denoise(
-                model=self, # type: ignore[arg-type]
+                model=self,  # type: ignore[arg-type]
                 pcl_noisy=pc_noisy,
                 patch_size=1000,
                 seed_k=6,
@@ -129,6 +121,7 @@ class DirectionDistanceVelocityModule(ModelSpec):
             if not self.is_predict():
                 assert b.meta is not None
                 res.append({
+                    "pc_noisy": b.meta["pc_noisy"],
                     "pc_clean": b.meta["pc_clean"],
                     "pc_mix": b.meta["pc_mix"],
                 })

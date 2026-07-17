@@ -1,6 +1,6 @@
 mode: predict
 debug: False
-load_ckpt: /root/autodl-tmp/jittor_pcd/experiments/dcvm/checkpoint_99.pkl
+load_ckpt: /root/autodl-tmp/experiments/surface_straight_vm/checkpoint_19.pkl
 
 components:
   data: predict_noisy_test
@@ -10,5 +10,5 @@ components:
 
 writer:
   __target__: vm
-  save_dir: /root/autodl-tmp/jittor_pcd/dcvm_denoisy_test_raw
+  save_dir: /root/autodl-tmp/surface_straight_vm_denoisy_test_raw
   save_name: denoised

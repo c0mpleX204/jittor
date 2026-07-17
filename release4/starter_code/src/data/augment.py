@@ -112,6 +112,10 @@ class AugmentAddNoise(Augment):
     noise_type: str="laplace"
 
     enabled: bool=True
+
+    l2_noise_std: Optional[float]=None
+
+    use_l2_as_noisy: bool=False
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentAddNoise':
@@ -127,6 +131,14 @@ class AugmentAddNoise(Augment):
         noise_std = np.random.uniform(self.noise_std_min, self.noise_std_max)
         noise = _sample_noise(self.noise_type, noise_std, pc.shape)
         asset.sampled_vertices_noisy = pc + noise
+        if self.l2_noise_std is not None:
+            noise_l2 = _sample_noise(self.noise_type, self.l2_noise_std, pc.shape)
+            pc_noisy_l2 = pc + noise_l2
+            if asset.meta is None:
+                asset.meta = {}
+            asset.meta['sampled_vertices_noisy_l2'] = pc_noisy_l2
+            if self.use_l2_as_noisy:
+                asset.sampled_vertices_noisy = pc_noisy_l2
 
 @dataclass(frozen=True)
 class AugmentAddMixedNoise(Augment):
@@ -294,6 +306,17 @@ class AugmentLinear(Augment):
             scale[3, 3] = 1.0
             trans_vertex = scale @ trans_vertex
         asset.transform(trans_vertex)
+        rot = trans_vertex[:3, :3].transpose()
+        trans = trans_vertex[:3, 3]
+        if asset.sampled_vertices is not None:
+            asset.sampled_vertices = np.matmul(asset.sampled_vertices, rot) + trans
+        if asset.sampled_vertices_noisy is not None:
+            asset.sampled_vertices_noisy = np.matmul(asset.sampled_vertices_noisy, rot) + trans
+        if asset.meta is not None and 'sampled_vertices_noisy_l2' in asset.meta:
+            asset.meta['sampled_vertices_noisy_l2'] = np.matmul(
+                asset.meta['sampled_vertices_noisy_l2'],
+                rot,
+            ) + trans
 
 @dataclass(frozen=True)
 class AugmentPatch(Augment):
@@ -303,6 +326,12 @@ class AugmentPatch(Augment):
     num_patches: int
     
     train_cvm_network: bool
+
+    straight_time: bool=False
+
+    surface_target: bool=False
+
+    use_noisy_l2: bool=False
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentPatch':
@@ -315,6 +344,9 @@ class AugmentPatch(Augment):
         
         assert pc is not None
         assert pc_noisy is not None
+
+        if self.use_noisy_l2 and asset.meta is not None and 'sampled_vertices_noisy_l2' in asset.meta:
+            pc_noisy = asset.meta['sampled_vertices_noisy_l2']
         
         N = pc_noisy.shape[0]
         
@@ -325,15 +357,27 @@ class AugmentPatch(Augment):
         _, nn_idx = tree.query(seed_points, k=self.patch_size)   # (P, M)
 
         pat_A = pc_noisy[nn_idx]  # (P, M, 3)
-        pat_B = pc[nn_idx]        # (P, M, 3)
+        if self.surface_target:
+            clean_tree = cKDTree(pc)
+            _, surface_idx = clean_tree.query(pat_A.reshape(-1, 3), k=1)
+            pat_B = pc[surface_idx].reshape(self.num_patches, self.patch_size, 3)
+            _, seed_surface_idx = clean_tree.query(seed_points, k=1)
+            seed_targets = pc[seed_surface_idx]
+        else:
+            pat_B = pc[nn_idx]        # (P, M, 3)
+            seed_targets = pc[seed_idx]
 
         l1, l2 = 1e-8, 1.0
-        t = np.random.rand(self.num_patches, self.patch_size, 1)
+        if self.straight_time:
+            t = np.random.rand(self.num_patches, 1, 1)
+            t = np.broadcast_to(t, (self.num_patches, self.patch_size, 1))
+        else:
+            t = np.random.rand(self.num_patches, self.patch_size, 1)
         t = (l2 - l1) * t + l1
         
         pat_t = t * pat_B + (1 - t) * pat_A
         seed_points_t = (
-            t[:, 0:1, :] * pc[seed_idx][:, None, :] +
+            t[:, 0:1, :] * seed_targets[:, None, :] +
             (1 - t[:, 0:1, :]) * pc_noisy[seed_idx][:, None, :]
         )
         
@@ -346,6 +390,8 @@ class AugmentPatch(Augment):
         asset.meta['pc_noisy'] = pat_A
         asset.meta['pc_clean'] = pat_B
         asset.meta['pc_mix'] = pat_t
+        if self.straight_time:
+            asset.meta['pc_time'] = t[:, 0, 0]
 
 def get_augments(*args) -> List[Augment]:
     MAP = {
