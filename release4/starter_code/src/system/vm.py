@@ -13,13 +13,35 @@ class VMWriter(DummyWriter):
         self.save_dir = save_dir
         self.save_name = save_name
         self.output_format = output_format
+
+    def _relative_output_dir(self, path: str, dataset_module=None) -> str:
+        if not os.path.isabs(path):
+            return os.path.dirname(path)
+
+        roots = []
+        if dataset_module is not None and getattr(dataset_module, "predict_datapath", None) is not None:
+            for datapath in dataset_module.predict_datapath.values():
+                root = getattr(datapath, "input_dataset_dir", "")
+                if root:
+                    roots.append(os.path.abspath(root))
+
+        abs_path = os.path.abspath(path)
+        for root in roots:
+            try:
+                rel = os.path.relpath(abs_path, root)
+            except ValueError:
+                continue
+            if not rel.startswith(".."):
+                return os.path.dirname(rel)
+
+        return os.path.dirname(os.path.basename(path))
     
     def write(self, batch, prediction: List[Dict], dataset_module=None):
         pc_noisy_batch = batch['pc_noisy']
         for i, asset in enumerate(batch['asset']):
             path = asset.path
             assert path is not None, "asset path is None"
-            dirname = os.path.join(self.save_dir, os.path.dirname(path))
+            dirname = os.path.join(self.save_dir, self._relative_output_dir(path, dataset_module))
             os.makedirs(dirname, exist_ok=True)
             denoised = prediction[i]['pc_denoised']
             if isinstance(denoised, np.ndarray):
