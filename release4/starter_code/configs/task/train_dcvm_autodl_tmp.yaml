@@ -2,7 +2,7 @@ mode: train
 debug: False
 
 components:
-  data: train
+  data: train_surface_straight_autodl_tmp
   transform: surface_straight
   system: dcvm_autodl_tmp
   model: dcvm
