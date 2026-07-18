@@ -1,0 +1,28 @@
+__target__: StraightPCFDistanceVelocityModule
+
+# Frozen Surface-Straight VM used to provide per-point displacement.
+vm_ckpt: /root/autodl-tmp/experiments/surface_straight_vm_from32_nf3000_b2_lr5e5_40ep/checkpoint_9.pkl
+velocity_denoise_steps: 4
+
+velocity_model:
+  frame_knn: 16
+  num_train_points: 128
+  feat_embedding_dim: 256
+  decoder_hidden_dim: 64
+  dsm_sigma: 0.01
+  denoise_steps: 4
+
+# Patch-level ratio estimator.
+distance_frame_knn: 16
+distance_feat_embedding_dim: 128
+distance_decoder_hidden_dim: 64
+
+# Decoder sigmoid is mapped into this interval; midpoint starts at r ~= 1.0.
+ratio_min: 0.5
+ratio_max: 1.5
+target_ratio_min: 0.5
+target_ratio_max: 1.5
+
+dsm_sigma: 0.01
+ratio_loss_weight: 1.0
+reconstruction_loss_weight: 1.0
