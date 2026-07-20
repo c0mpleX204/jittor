@@ -1,25 +1,12 @@
-Prompt for teammate AI: CVM distribution-constrained experiment
+给队友 AI 的短提示词：多 VM 加分布约束
 
-Project context
-===============
+先读代码，不要凭记忆假设。项目路径：
 
-We are working on the Jittor point cloud denoising competition.
+本地结构：release4/starter_code/...
+云端运行：/root/src/starter_code
+分支：exp/surface-straight-vm
 
-Do not guess from memory. First read the repository code and docs.
-
-Local repository structure:
-
-release4/starter_code/...
-
-Cloud runtime directory:
-
-/root/src/starter_code
-
-Active branch:
-
-exp/surface-straight-vm
-
-Read these files first:
+先读这些文件：
 
 docs/straightpcf_cvm_reproduction_tmp.md
 docs/patch_cache_reminder.md
@@ -28,178 +15,68 @@ src/model/dcvm.py
 src/model/vm.py
 src/model/feature.py
 
-Current best model family
-=========================
+当前最强主干是多 VM / CVM，不是单 VM：
 
-The current strongest model is not the old single VM. It is the official-style
-multi-VM / CVM model:
-
-StraightPCFCoupledVelocityModule
-
-Code file:
-
-src/model/straightpcf_vm_dm.py
-
-Best checkpoint so far:
-
+模型：StraightPCFCoupledVelocityModule
+代码：src/model/straightpcf_vm_dm.py
+当前最好权重：
 /root/autodl-tmp/experiments/straightpcf_cvm_cache12000_ep29_ft30_lr5e5/checkpoint_29.pkl
 
-Local score:
-
+分数：
 CD 58.6531
 P2S 78.6321
 final 68.6426
 
-Previous best single Surface-Straight VM:
+任务目标：
+不要继续在单 VM 后面硬接 CDRefine。请在多 VM / CVM 训练里加入小权重分布约束，让模型一边贴近 surface，一边保持 clean patch 覆盖。
 
-/root/autodl-tmp/experiments/surface_straight_vm_from32_nf3000_b2_lr5e5_40ep/checkpoint_9.pkl
-
-Score:
-
-CD 54.0110
-P2S 71.0060
-final 62.5085
-
-Therefore, new experiments should continue from the CVM checkpoint, not from the
-old single VM.
-
-Experiment goal
-===============
-
-Do not continue the old single-VM CDRefine route as the main path.
-
-Instead, add distribution constraints directly inside the multi-VM / CVM
-training target. The goal is:
-
-1. keep the CVM's surface/P2S strength,
-2. improve CD by preserving clean patch coverage and local density,
-3. avoid a two-stage pipeline where stage 1 damages distribution and stage 2
-   tries to repair it from only local patch information.
-
-Suggested new model
-===================
-
-Create a new model class instead of modifying the existing CVM destructively:
-
-StraightPCFCoupledVelocityDistributionModule
-
-Suggested new file:
+建议新建模型，不要破坏原 CVM：
 
 src/model/straightpcf_cvm_distribution.py
+class StraightPCFCoupledVelocityDistributionModule
 
-Register it in:
+并在 src/model/parse.py 注册。
 
-src/model/parse.py
+loss 思路：
 
-Implementation idea
-===================
-
-Keep the original CVM losses:
-
-- direction loss
-- consistency loss
-
-Then add small-weight distribution constraints on the predicted output patch:
-
-loss = cvm_loss
-     + chamfer_weight * chamfer(pc_pred, pc_clean)
-     + surface_weight * surface_proxy(pc_pred, pc_clean)
+loss = 原 CVM loss
+     + chamfer_weight * Chamfer(pc_pred, pc_clean)
      + residual_weight * ||pc_pred - pc_current||^2
-     + density_weight * density_matching(pc_pred, pc_clean)
+     + 可选 density_weight * density_matching(pc_pred, pc_clean)
 
-Definitions:
+先只做最小版：
 
-pc_current:
-  The current interpolated patch from cache, usually batch["pc_mix"].
+原 CVM loss + 小权重 Chamfer + 小权重 residual_anchor
 
-pc_clean:
-  The target surface/clean patch from cache, batch["pc_clean"].
+先不要加很强的 density loss，容易把边缘和薄结构抹平。Chamfer/density 为省显存只随机采样 256 点算。
 
-pc_pred:
-  The output patch after applying the coupled VMs from pc_current.
-
-cvm_loss:
-  Original StraightPCFCoupledVelocityModule loss. Do not delete it.
-
-chamfer(pc_pred, pc_clean):
-  Directly encourages the output patch to cover the clean patch, helping CD.
-
-surface_proxy(pc_pred, pc_clean):
-  Uses pc_clean as a surface proxy for now, keeping output near the surface.
-  Later this can be replaced with exact mesh closest-point supervision.
-
-residual_anchor:
-  Penalizes excessive movement, for example ||pc_pred - pc_current||^2. This
-  prevents the model from moving points too aggressively to satisfy Chamfer.
-
-density_matching:
-  Do not use a blind "push all points apart" loss at first. Prefer matching the
-  local kNN distance distribution of pc_pred to pc_clean. This is safer for
-  edges and thin structures.
-
-Important implementation detail
-===============================
-
-Do not compute Chamfer and density on all 1000 patch points at first. Randomly
-sample a subset to save memory and time.
-
-Suggested settings:
+推荐初始超参：
 
 num_dist_points: 256
-density_k: 8 or 16
+chamfer_weight: 0.2
+residual_weight: 0.01
+density_weight: 0.0
+lr: 0.00002
+batch_size: 2
+num_workers: 0
 
-Start with the minimal stable version:
-
-1. original CVM loss
-2. small Chamfer loss
-3. small residual anchor
-
-Only add density matching after the minimal version is confirmed useful.
-
-Cloud sync flow
-===============
-
-If the cloud temporary repo already exists:
+云端同步：
 
 TMP=/root/src/jittor_surface_straight_branch
-
 cd "$TMP"
 git fetch origin exp/surface-straight-vm
 git checkout exp/surface-straight-vm
 git reset --hard origin/exp/surface-straight-vm
-
 rsync -av "$TMP/release4/starter_code/" /root/src/starter_code/
 
-cd /root/src/starter_code
-python -m py_compile src/model/straightpcf_vm_dm.py src/model/parse.py
-
-If there is no temporary repo yet:
-
-cd /root/src
-
-git clone --depth 1 -b exp/surface-straight-vm \
-  https://gitlink.org.cn/c0mplex/jittor-jintiansantiaoqu-denoising.git \
-  /root/src/jittor_surface_straight_branch
-
-rsync -av /root/src/jittor_surface_straight_branch/release4/starter_code/ /root/src/starter_code/
-
-Patch cache flow
-================
-
-Do not train by loading OBJ meshes online. It is slow and Jittor workers can
-crash. Use the patch cache.
-
-Current cache:
+训练用 patch cache，不要在线读 OBJ：
 
 /root/autodl-tmp/cache_surface_straight_nf12000_seed123
 
-Check it:
+检查 cache：
 
 cd /root/src/starter_code
-
-CACHE=/root/autodl-tmp/cache_surface_straight_nf12000_seed123
-
-wc -l "$CACHE/train_cache.txt"
+wc -l /root/autodl-tmp/cache_surface_straight_nf12000_seed123/train_cache.txt
 
 python - <<'PY'
 import numpy as np
@@ -209,348 +86,33 @@ print(d.files)
 print({k:d[k].shape for k in d.files})
 PY
 
-Expected fields:
+必须有：pc_noisy, pc_clean, pc_mix, pc_time。
 
-pc_noisy
-pc_clean
-pc_mix
-pc_time
+训练策略：
 
-If cache does not exist, build it:
-
-cd /root/src/starter_code
-
-python tools/build_patch_cache.py \
-  --dataset-dir /root/autodl-tmp/dataset_train \
-  --list datalist/train.txt \
-  --transform configs/transform/surface_straight.yaml \
-  --out-dir /root/autodl-tmp/cache_surface_straight_nf12000_seed123 \
-  --num-items 12000 \
-  --seed 123 \
-  --overwrite
-
-Temporary YAML policy
-=====================
-
-Do not commit experiment YAML files until a setting is confirmed useful. Write
-temporary YAML directly on the cloud using cat > ...
-
-Common cache YAML:
-
-cd /root/src/starter_code
-
-CACHE=/root/autodl-tmp/cache_surface_straight_nf12000_seed123
-
-cat > configs/transform/cache_passthrough_tmp.yaml <<'YAML'
-train_transform: {}
-validate_transform: {}
-predict_transform: {}
-YAML
-
-cat > configs/data/train_cache_surface_12000_tmp.yaml <<YAML
-train_dataset:
-  shuffle: True
-  batch_size: 2
-  num_workers: 0
-  datapath:
-    input_dataset_dir: $CACHE
-    use_prob: False
-    loader: npz_patch
-    data_name: patch.npz
-    ignore_check: True
-    data_path:
-      cache: [
-        [$CACHE/train_cache.txt, 1.0],
-      ]
-YAML
-
-Suggested model YAML
-====================
-
-Adjust field names to match the implemented model.
-
-cat > configs/model/straightpcf_cvm_distribution_tmp.yaml <<'YAML'
-__target__: StraightPCFCoupledVelocityDistributionModule
-
-num_modules: 2
-tot_its: 4
-num_train_points: 128
-dsm_sigma: 0.01
-consistency_loss_weight: 10.0
-
-num_dist_points: 256
-chamfer_weight: 0.2
-surface_weight: 0.1
-residual_weight: 0.01
-density_weight: 0.05
-density_k: 8
-
-velocity_model:
-  frame_knn: 16
-  num_train_points: 128
-  feat_embedding_dim: 256
-  decoder_hidden_dim: 64
-  dsm_sigma: 0.01
-  denoise_steps: 4
-YAML
-
-Training strategy
-=================
-
-Do not train from scratch. Continue from the current best CVM:
-
+从当前最好 CVM 继续训，不要从头训：
 /root/autodl-tmp/experiments/straightpcf_cvm_cache12000_ep29_ft30_lr5e5/checkpoint_29.pkl
 
-First run:
+第一轮只跑 5 或 10 epoch。看 CD/P2S/final，不只看 loss。
 
-5 epochs or 10 epochs only.
+判断标准：
 
-Recommended:
+CD 涨，P2S 掉不到 1：继续
+CD 涨 2 左右，P2S 掉 1-2：仍可继续
+P2S 掉超过 3 且 final 不涨：loss 太激进，降权重或降 lr
+CD 和 P2S 都涨：继续 10 epoch
 
-debug run: 5 epochs
-useful run: 10-20 epochs
+预测评分用：
 
-Use a smaller LR because this is finetuning from a strong checkpoint:
+tools/local_collect_predictions.py
+tools/score_cd_p2s_official.py
 
-lr = 0.00002
+本地 full test 是 datalist/noisy_test.txt，约 100 个样本。half test 只能和 half baseline 比，不能直接和 full100 的 68.6426 比。
 
-Suggested training YAML:
+不要做：
 
-cat > configs/system/straightpcf_cvm_distribution_ft10_tmp.yaml <<'YAML'
-__target__: vm
-ckpt_save_dir: /root/autodl-tmp/experiments/straightpcf_cvm_distribution_from_ep59_wdist_ft10
-ckpt_save_name: checkpoint
-YAML
-
-cat > configs/task/train_straightpcf_cvm_distribution_ft10_tmp.yaml <<'YAML'
-mode: train
-debug: False
-load_ckpt: /root/autodl-tmp/experiments/straightpcf_cvm_cache12000_ep29_ft30_lr5e5/checkpoint_29.pkl
-
-components:
-  data: train_cache_surface_12000_tmp
-  transform: cache_passthrough_tmp
-  system: straightpcf_cvm_distribution_ft10_tmp
-  model: straightpcf_cvm_distribution_tmp
-
-loss:
-  loss: 1.0
-
-optimizer:
-  __target__: adam
-  lr: 0.00002
-
-trainer:
-  epochs: 10
-YAML
-
-python run.py --task configs/task/train_straightpcf_cvm_distribution_ft10_tmp.yaml \
-  2>&1 | tee /root/autodl-tmp/train_straightpcf_cvm_distribution_from_ep59_ft10.log
-
-Evaluation criteria
-===================
-
-Always report:
-
-Mean CD score
-Mean P2S score
-Mean final score
-
-Current full-test baseline:
-
-CD 58.6531
-P2S 78.6321
-final 68.6426
-
-Decision rules:
-
-CD +1 and P2S drop < 1:
-  Continue.
-
-CD +2 and P2S drop 1-2:
-  Still worth continuing.
-
-P2S drop > 3 and final does not improve:
-  Loss is too aggressive. Lower chamfer/density/surface weights or LR.
-
-CD and P2S both improve:
-  Continue 10 more epochs.
-
-Prediction YAML
-===============
-
-cat > configs/data/predict_noisy_test_tmp.yaml <<'YAML'
-predict_dataset:
-  shuffle: False
-  batch_size: 1
-  num_workers: 0
-  datapath:
-    input_dataset_dir: /root/autodl-tmp/noisy_test
-    use_prob: False
-    loader: npy
-    data_name: noisy.npy
-    ignore_check: True
-    data_path:
-      shapenet: [
-        [./datalist/noisy_test.txt, 1.0],
-      ]
-YAML
-
-Prediction and scoring template
-===============================
-
-cd /root/src/starter_code
-
-CKPT=/root/autodl-tmp/experiments/straightpcf_cvm_distribution_from_ep59_wdist_ft10/checkpoint_9.pkl
-EXP=straightpcf_cvm_distribution_from_ep59_ft10_ep9
-
-cat > configs/task/predict_${EXP}_tmp.yaml <<YAML
-mode: predict
-debug: False
-load_ckpt: $CKPT
-
-components:
-  data: predict_noisy_test_tmp
-  transform: predict_npy
-  system: vm
-  model: straightpcf_cvm_distribution_tmp
-
-writer:
-  __target__: vm
-  save_dir: /root/autodl-tmp/${EXP}_raw
-  save_name: denoised
-YAML
-
-python run.py --task configs/task/predict_${EXP}_tmp.yaml
-
-python tools/local_collect_predictions.py \
-  --raw-dir /root/autodl-tmp/${EXP}_raw \
-  --out-dir /root/autodl-tmp/${EXP} \
-  --list datalist/noisy_test.txt \
-  --input-prefix noisy_test \
-  --overwrite
-
-mkdir -p /root/autodl-tmp/${EXP}_score
-
-python tools/score_cd_p2s_official.py \
-  --pred_dir /root/autodl-tmp/${EXP} \
-  --noisy_dir /root/autodl-tmp/noisy_test \
-  --gt_dir /root/autodl-tmp/true_test \
-  --mesh_dir /root/autodl-tmp/dataset_train \
-  --out_dir /root/autodl-tmp/${EXP}_score \
-  --workers 8 | tee /root/autodl-tmp/${EXP}_score/score.log
-
-If collect cannot find predictions, use fallback:
-
-python tools/local_collect_predictions.py \
-  --raw-dir /root/autodl-tmp \
-  --out-dir /root/autodl-tmp/${EXP} \
-  --list datalist/noisy_test.txt \
-  --input-prefix noisy_test \
-  --overwrite
-
-How to shorten testing time
-===========================
-
-Full local test is about 100 samples. Prediction is slow because every sample
-does FPS, KNN patch extraction, CVM denoising, and patch stitching.
-
-For checkpoint screening, create a fixed half test list:
-
-cd /root/src/starter_code
-
-python - <<'PY'
-from pathlib import Path
-src = Path("datalist/noisy_test.txt")
-lines = [x.strip() for x in src.read_text().splitlines() if x.strip()]
-quick = lines[::2]
-Path("datalist/noisy_test_half.txt").write_text("\n".join(quick) + "\n")
-print(len(quick), "/", len(lines))
-PY
-
-cat > configs/data/predict_noisy_test_half_tmp.yaml <<'YAML'
-predict_dataset:
-  shuffle: False
-  batch_size: 1
-  num_workers: 0
-  datapath:
-    input_dataset_dir: /root/autodl-tmp/noisy_test
-    use_prob: False
-    loader: npy
-    data_name: noisy.npy
-    ignore_check: True
-    data_path:
-      shapenet: [
-        [./datalist/noisy_test_half.txt, 1.0],
-      ]
-YAML
-
-Important:
-
-half score can only be compared with a half baseline.
-Do not compare half score directly with the full100 score 68.6426.
-Final candidates must be scored on full100.
-
-Training efficiency
-===================
-
-Use patch cache:
-
-12000 cache
-batch_size = 2
-num_workers = 0
-
-Expected log:
-
-6000 batches/epoch
-about 2m20s/epoch
-
-Do not blindly use num_workers=2. It was unstable before. With patch cache,
-num_workers=0 is already fast.
-
-If GPU memory is very free, cautiously try:
-
-batch_size = 4
-
-Run 1 epoch first to check OOM and loss.
-
-Denoise / scoring efficiency
-============================
-
-Use half set for checkpoint screening.
-Run full100 only for final candidates.
-
-Use:
-
---workers 8
-
-for scoring. If CPU is idle, try:
-
---workers 16
-
-The truly lossless future optimization is predict patch cache: cache noisy_test
-FPS/KNN patch indices and stitching information. It is not implemented yet.
-
-Do not do
-=========
-
-Do not:
-
-1. Go back to single-VM CDRefine as the main route.
-2. Train the distribution model from scratch.
-3. Commit temporary YAML files before results are confirmed.
-4. Judge by loss only; always score CD/P2S.
-5. Compare half-set score directly to full100 score.
-6. Start with a large density loss.
-
-Recommended first implementation
-================================
-
-Start with:
-
-original CVM loss
-+ chamfer(pc_pred, pc_clean)
-+ residual_anchor
-
-Do not add density first. If this improves CD without breaking P2S, then add
-density matching later.
+1. 回到单 VM 当主线
+2. 从头训练
+3. 把临时 YAML 提交进仓库
+4. 只看 loss 不测分
+5. 一开始就上大 density loss
