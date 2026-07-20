@@ -1,0 +1,228 @@
+Human-readable brief: CVM + distribution constraint
+
+Current status
+==============
+
+Our strongest model is now the multi-VM / CVM version, not the old single VM.
+
+Branch:
+
+exp/surface-straight-vm
+
+Important model:
+
+StraightPCFCoupledVelocityModule
+
+Code:
+
+src/model/straightpcf_vm_dm.py
+
+Current best checkpoint:
+
+/root/autodl-tmp/experiments/straightpcf_cvm_cache12000_ep29_ft30_lr5e5/checkpoint_29.pkl
+
+Score:
+
+CD 58.6531
+P2S 78.6321
+final 68.6426
+
+Old single VM best was only:
+
+CD 54.0110
+P2S 71.0060
+final 62.5085
+
+So new work should continue from the CVM checkpoint, not from the single VM.
+
+Why change direction
+====================
+
+The old CDRefine route was done after a single VM. It tries to repair CD after
+the first stage has already moved points strongly toward the surface.
+
+The problem is that if stage 1 damages point distribution, a local second-stage
+refiner may not recover missing coverage or global sampling structure.
+
+A better direction is:
+
+Train the multi-VM model to improve P2S and CD at the same time.
+
+In plain words:
+
+Do not first push every point aggressively toward the surface and then repair
+CD. Instead, make the main model learn:
+
+1. stay close to the surface,
+2. preserve clean patch coverage,
+3. avoid moving too far,
+4. avoid local point collapse.
+
+Suggested experiment
+====================
+
+Add a new model, do not overwrite the current CVM:
+
+StraightPCFCoupledVelocityDistributionModule
+
+Suggested file:
+
+src/model/straightpcf_cvm_distribution.py
+
+Register it in:
+
+src/model/parse.py
+
+Keep the original CVM loss, then add small distribution losses:
+
+loss = original CVM loss
+     + small Chamfer loss
+     + small surface proxy loss
+     + small residual anchor
+     + optional density matching
+
+Meaning:
+
+Original CVM loss:
+  Keeps the strong multi-VM straight-flow behavior.
+
+Chamfer loss:
+  Helps output points cover the clean patch, so it targets CD.
+
+Surface proxy:
+  Keeps points near the surface, so P2S does not collapse.
+
+Residual anchor:
+  Prevents excessive movement.
+
+Density matching:
+  Makes local point spacing closer to clean patch spacing. Add this later, not
+  in the first version.
+
+Recommended first version
+=========================
+
+Start simple:
+
+original CVM loss
++ Chamfer(pc_pred, pc_clean)
++ residual anchor
+
+Do not add density first. Density can easily over-smooth edges if the weight is
+too strong.
+
+Training plan
+=============
+
+Use patch cache:
+
+/root/autodl-tmp/cache_surface_straight_nf12000_seed123
+
+Continue from:
+
+/root/autodl-tmp/experiments/straightpcf_cvm_cache12000_ep29_ft30_lr5e5/checkpoint_29.pkl
+
+Do not train from scratch.
+
+Use:
+
+batch_size = 2
+num_workers = 0
+lr = 0.00002
+
+First run:
+
+5 or 10 epochs
+
+Then score:
+
+Mean CD score
+Mean P2S score
+Mean final score
+
+Baseline to beat:
+
+CD 58.6531
+P2S 78.6321
+final 68.6426
+
+How to judge
+============
+
+Good:
+
+CD rises and P2S drops less than 1 point.
+
+Very good:
+
+CD and P2S both rise.
+
+Still worth trying:
+
+CD rises by about 2 and P2S drops by 1-2.
+
+Bad:
+
+P2S drops more than 3 and final does not improve.
+
+If bad:
+
+Lower Chamfer/density weight or lower LR.
+
+Cloud workflow reminder
+=======================
+
+Cloud runtime:
+
+/root/src/starter_code
+
+Temporary git repo:
+
+/root/src/jittor_surface_straight_branch
+
+Sync code:
+
+TMP=/root/src/jittor_surface_straight_branch
+
+cd "$TMP"
+git fetch origin exp/surface-straight-vm
+git checkout exp/surface-straight-vm
+git reset --hard origin/exp/surface-straight-vm
+
+rsync -av "$TMP/release4/starter_code/" /root/src/starter_code/
+
+Read:
+
+docs/straightpcf_cvm_reproduction_tmp.md
+docs/patch_cache_reminder.md
+
+Efficiency notes
+================
+
+Training is fast because of patch cache:
+
+about 6000 batches/epoch
+about 2m20s/epoch
+
+Prediction is slow because it must do FPS, KNN patch extraction, CVM denoise,
+and patch stitching for each test sample.
+
+For quick checkpoint screening, use a fixed half test set, but only compare it
+against a half-set baseline. Final candidates must still be scored on the full
+local test set.
+
+Do not do
+=========
+
+Do not go back to single VM as the main route.
+Do not train from scratch.
+Do not commit temporary YAML before results are confirmed.
+Do not judge by loss only.
+Do not start with large density loss.
+
+One-sentence summary
+====================
+
+Move CD improvement into the multi-VM training objective itself: keep the CVM's
+surface-denoising strength, but add small losses so the output still looks like
+the clean patch distribution.
