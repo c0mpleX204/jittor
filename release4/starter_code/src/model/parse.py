@@ -1,10 +1,12 @@
 from .spec import ModelSpec
+from .coupled_vm import CoupledSurfaceStraightVelocityModule
 from .dcvm import DirectionDistanceVelocityModule
 from .distance_vm import StraightPCFDistanceVelocityModule
 from .vm import VelocityModule
 
 def get_model(model_config, **kwargs) -> ModelSpec:
     MAP = {
+        'CoupledSurfaceStraightVelocityModule': CoupledSurfaceStraightVelocityModule,
         'DirectionDistanceVelocityModule': DirectionDistanceVelocityModule,
         'StraightPCFDistanceVelocityModule': StraightPCFDistanceVelocityModule,
         'VelocityModule': VelocityModule,
