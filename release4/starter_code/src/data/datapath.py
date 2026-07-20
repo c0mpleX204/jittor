@@ -50,6 +50,25 @@ class NpyLazyAsset(LazyAsset):
         return asset
 
 @dataclass
+class NpzPatchLazyAsset(LazyAsset):
+    # load cached training patch arrays prepared by tools/build_patch_cache.py
+    def load(self) -> 'Asset':
+        with np.load(self.path) as data:
+            meta = {
+                'pc_noisy': data['pc_noisy'].astype(np.float64),
+                'pc_clean': data['pc_clean'].astype(np.float64),
+                'pc_mix': data['pc_mix'].astype(np.float64),
+            }
+            if 'pc_time' in data:
+                meta['pc_time'] = data['pc_time'].astype(np.float64)
+        asset = Asset(
+            path=self.path,
+            cls=self.cls,
+            meta=meta,
+        )
+        return asset
+
+@dataclass
 class Datapath(ConfigSpec):
     """handle input data paths"""
     
@@ -92,6 +111,7 @@ class Datapath(ConfigSpec):
             None: ObjLazyAsset,
             'obj': ObjLazyAsset,
             'npy': NpyLazyAsset,
+            'npz_patch': NpzPatchLazyAsset,
         }
         input_dataset_dir = kwargs.get('input_dataset_dir', '')
         num_files = kwargs.get('num_files', None)
