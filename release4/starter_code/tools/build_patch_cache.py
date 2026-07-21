@@ -56,8 +56,12 @@ def save_patch(path: Path, meta: Dict[str, np.ndarray], patch_idx: int) -> None:
         "pc_clean": meta["pc_clean"][patch_idx:patch_idx + 1].astype(np.float32),
         "pc_mix": meta["pc_mix"][patch_idx:patch_idx + 1].astype(np.float32),
     }
-    if "pc_time" in meta:
-        payload["pc_time"] = np.asarray(meta["pc_time"][patch_idx:patch_idx + 1], dtype=np.float32)
+    for optional_key in ("pc_time", "pc_clean_corr", "pc_normal"):
+        if optional_key in meta:
+            payload[optional_key] = np.asarray(
+                meta[optional_key][patch_idx:patch_idx + 1],
+                dtype=np.float32,
+            )
     np.savez_compressed(path, **payload)
 
 

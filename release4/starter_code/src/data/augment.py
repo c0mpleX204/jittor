@@ -357,6 +357,7 @@ class AugmentPatch(Augment):
         _, nn_idx = tree.query(seed_points, k=self.patch_size)   # (P, M)
 
         pat_A = pc_noisy[nn_idx]  # (P, M, 3)
+        pat_clean_corr = pc[nn_idx]  # original clean counterpart for each noisy point
         if self.surface_target:
             clean_tree = cKDTree(pc)
             _, surface_idx = clean_tree.query(pat_A.reshape(-1, 3), k=1)
@@ -384,11 +385,13 @@ class AugmentPatch(Augment):
         pat_A = pat_A - seed_points_t
         pat_B = pat_B - seed_points_t
         pat_t = pat_t - seed_points_t
+        pat_clean_corr = pat_clean_corr - seed_points_t
         
         if asset.meta is None:
             asset.meta = {}
         asset.meta['pc_noisy'] = pat_A
         asset.meta['pc_clean'] = pat_B
+        asset.meta['pc_clean_corr'] = pat_clean_corr
         asset.meta['pc_mix'] = pat_t
         if self.straight_time:
             asset.meta['pc_time'] = t[:, 0, 0]

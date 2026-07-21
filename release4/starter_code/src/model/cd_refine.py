@@ -92,6 +92,10 @@ class CDRefineModule(ModelSpec):
     Training reads pc_stage1 from a refine cache and predicts a small residual:
         pc_final = pc_stage1 + delta
 
+    For CD-oriented training, prefer pc_clean_corr as the target_field. It is
+    the original clean counterpart of each noisy point, while pc_clean can stay
+    as the nearest-surface anchor for P2S preservation.
+
     Prediction can wrap the full noisy -> CVM+DM -> CDRefine pipeline when a
     stage1 checkpoint is provided in the model config.
     """
@@ -108,8 +112,12 @@ class CDRefineModule(ModelSpec):
         self.chamfer_num_points = cfg.get("chamfer_num_points", 256)
         self.chamfer_loss_weight = cfg.get("chamfer_loss_weight", 1.0)
         self.residual_anchor_weight = cfg.get("residual_anchor_weight", 0.02)
+        self.point_anchor_weight = cfg.get("point_anchor_weight", 0.05)
         self.surface_anchor_weight = cfg.get("surface_anchor_weight", 0.05)
         self.allow_direct_refine = cfg.get("allow_direct_refine", False)
+        self.target_field = cfg.get("target_field", "pc_clean_corr")
+        self.fallback_target_field = cfg.get("fallback_target_field", "pc_clean")
+        self.surface_field = cfg.get("surface_field", "pc_clean")
 
         self.encoder = FeatureExtraction(
             k=self.frame_knn,
@@ -158,18 +166,22 @@ class CDRefineModule(ModelSpec):
         delta = self._predict_delta(pc_stage1)
         return pc_stage1 + delta, delta
 
-    def get_supervised_loss(self, pc_stage1, pc_clean):
+    def get_supervised_loss(self, pc_stage1, pc_target, pc_surface=None):
+        if pc_surface is None:
+            pc_surface = pc_target
         pc_final, delta = self.refine(pc_stage1)
         chamfer = _chamfer_loss(
             pc_pred=pc_final,
-            pc_target=pc_clean,
+            pc_target=pc_target,
             num_points=self.chamfer_num_points,
         )
         residual_anchor = (delta ** 2.0).sum(dim=-1).mean()
-        surface_anchor = ((pc_final - pc_clean) ** 2.0).sum(dim=-1).mean()
+        point_anchor = ((pc_final - pc_target) ** 2.0).sum(dim=-1).mean()
+        surface_anchor = ((pc_final - pc_surface) ** 2.0).sum(dim=-1).mean()
         return (
             self.chamfer_loss_weight * chamfer +
             self.residual_anchor_weight * residual_anchor +
+            self.point_anchor_weight * point_anchor +
             self.surface_anchor_weight * surface_anchor
         ) / self.dsm_sigma
 
@@ -198,10 +210,14 @@ class CDRefineModule(ModelSpec):
     def training_step(self, batch: Dict) -> Dict:
         patch_size = batch["pc_stage1"].shape[-2]
         pc_stage1 = batch["pc_stage1"].reshape(-1, patch_size, 3)
-        pc_clean = batch["pc_clean"].reshape(-1, patch_size, 3)
+        pc_target = batch["pc_refine_target"].reshape(-1, patch_size, 3)
+        pc_surface = batch.get("pc_surface", None)
+        if pc_surface is not None:
+            pc_surface = pc_surface.reshape(-1, patch_size, 3)
         loss = self.get_supervised_loss(
             pc_stage1=pc_stage1,
-            pc_clean=pc_clean,
+            pc_target=pc_target,
+            pc_surface=pc_surface,
         )
         return {"loss": loss}
 
@@ -236,10 +252,22 @@ class CDRefineModule(ModelSpec):
                         f"{b.path} does not contain pc_stage1. "
                         "Build a refine cache with tools/build_refine_cache.py first."
                     )
+                target_key = self.target_field
+                if target_key not in b.meta:
+                    target_key = self.fallback_target_field
+                if target_key not in b.meta:
+                    raise KeyError(
+                        f"{b.path} does not contain {self.target_field} or "
+                        f"{self.fallback_target_field} for CDRefine supervision."
+                    )
                 d = {
                     "pc_stage1": b.meta["pc_stage1"],
-                    "pc_clean": b.meta["pc_clean"],
+                    "pc_refine_target": b.meta[target_key],
                 }
+                if self.surface_field in b.meta:
+                    d["pc_surface"] = b.meta[self.surface_field]
+                elif "pc_clean" in b.meta:
+                    d["pc_surface"] = b.meta["pc_clean"]
                 for optional_key in ("pc_noisy", "pc_mix", "pc_time"):
                     if optional_key in b.meta:
                         d[optional_key] = b.meta[optional_key]
