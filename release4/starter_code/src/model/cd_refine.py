@@ -142,8 +142,6 @@ class CDRefineModule(ModelSpec):
         self.density_loss_weight = cfg.get("density_loss_weight", 0.0)
         self.density_k = cfg.get("density_k", 8)
         self.density_num_points = cfg.get("density_num_points", self.chamfer_num_points)
-        self.condition_mode = cfg.get("condition_mode", "stage1")
-        self.condition_scale = cfg.get("condition_scale", 1.0)
         self.allow_direct_refine = cfg.get("allow_direct_refine", False)
         self.target_field = cfg.get("target_field", "pc_clean_corr")
         self.fallback_target_field = cfg.get("fallback_target_field", "pc_clean")
@@ -151,18 +149,9 @@ class CDRefineModule(ModelSpec):
         self.normal_field = cfg.get("normal_field", "pc_normal")
         self.normal_source_field = cfg.get("normal_source_field", "pc_noisy")
 
-        if self.condition_mode == "stage1":
-            input_dim = 3
-        elif self.condition_mode == "noisy_delta":
-            input_dim = 6
-        elif self.condition_mode == "noisy_full":
-            input_dim = 9
-        else:
-            raise ValueError(f"unsupported CDRefine condition_mode: {self.condition_mode}")
-
         self.encoder = FeatureExtraction(
             k=self.frame_knn,
-            input_dim=input_dim,
+            input_dim=3,
             embedding_dim=self.feat_embedding_dim,
             distance_estimation=cfg.get("normalize_features", True),
         )
@@ -194,36 +183,23 @@ class CDRefineModule(ModelSpec):
             if hasattr(param, "requires_grad"):
                 param.requires_grad = False
 
-    def _refine_input(self, pc_stage1, pc_noisy=None):
-        if self.condition_mode == "stage1":
-            return pc_stage1
-        if pc_noisy is None:
-            raise ValueError(f"condition_mode={self.condition_mode} requires pc_noisy")
-        noisy_delta = self.condition_scale * (pc_noisy - pc_stage1)
-        if self.condition_mode == "noisy_delta":
-            return jt.concat([pc_stage1, noisy_delta], dim=-1)
-        if self.condition_mode == "noisy_full":
-            return jt.concat([pc_stage1, pc_noisy, noisy_delta], dim=-1)
-        raise ValueError(f"unsupported CDRefine condition_mode: {self.condition_mode}")
-
-    def _predict_delta(self, pc_stage1, pc_noisy=None):
+    def _predict_delta(self, pc_stage1):
         B, N, d = pc_stage1.shape
-        refine_input = self._refine_input(pc_stage1, pc_noisy=pc_noisy)
-        feat = self.encoder(refine_input)
+        feat = self.encoder(pc_stage1)
         F_dim = feat.shape[-1]
         raw_delta = self.decoder(
             c=feat.reshape(-1, F_dim),
         ).reshape(B, N, d)
         return self.delta_scale * jt.tanh(raw_delta)
 
-    def refine(self, pc_stage1, pc_noisy=None):
-        delta = self._predict_delta(pc_stage1, pc_noisy=pc_noisy)
+    def refine(self, pc_stage1):
+        delta = self._predict_delta(pc_stage1)
         return pc_stage1 + delta, delta
 
-    def get_supervised_loss(self, pc_stage1, pc_target, pc_surface=None, pc_normal_proxy=None, pc_noisy=None):
+    def get_supervised_loss(self, pc_stage1, pc_target, pc_surface=None, pc_normal_proxy=None):
         if pc_surface is None:
             pc_surface = pc_target
-        pc_final, delta = self.refine(pc_stage1, pc_noisy=pc_noisy)
+        pc_final, delta = self.refine(pc_stage1)
         chamfer = _chamfer_loss(
             pc_pred=pc_final,
             pc_target=pc_target,
@@ -273,7 +249,7 @@ class CDRefineModule(ModelSpec):
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=None):
         with jt.no_grad():
             pc_stage1 = self._run_stage1(pcl_noisy, num_steps=num_steps)
-            pc_final, delta = self.refine(pc_stage1, pc_noisy=pcl_noisy)
+            pc_final, delta = self.refine(pc_stage1)
         return pc_final, delta
 
     def training_step(self, batch: Dict) -> Dict:
@@ -286,15 +262,11 @@ class CDRefineModule(ModelSpec):
         pc_normal_proxy = batch.get("pc_normal_proxy", None)
         if pc_normal_proxy is not None:
             pc_normal_proxy = pc_normal_proxy.reshape(-1, patch_size, 3)
-        pc_noisy = batch.get("pc_noisy", None)
-        if pc_noisy is not None:
-            pc_noisy = pc_noisy.reshape(-1, patch_size, 3)
         loss = self.get_supervised_loss(
             pc_stage1=pc_stage1,
             pc_target=pc_target,
             pc_surface=pc_surface,
             pc_normal_proxy=pc_normal_proxy,
-            pc_noisy=pc_noisy,
         )
         return {"loss": loss}
 
