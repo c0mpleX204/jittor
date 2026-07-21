@@ -85,6 +85,30 @@ def _chamfer_loss(pc_pred, pc_target, num_points: Optional[int]):
     return pred_to_target.mean() + target_to_pred.mean()
 
 
+def _density_matching_loss(pc_pred, pc_target, k: int, num_points: Optional[int]):
+    if k <= 0:
+        return 0.0
+    pc_pred = _sample_points(pc_pred, num_points)
+    pc_target = _sample_points(pc_target, num_points)
+    n_pred = pc_pred.shape[1]
+    n_target = pc_target.shape[1]
+    k_pred = min(k + 1, n_pred)
+    k_target = min(k + 1, n_target)
+    if k_pred <= 1 or k_target <= 1:
+        return 0.0
+
+    pred_dist = ((pc_pred.unsqueeze(2) - pc_pred.unsqueeze(1)) ** 2.0).sum(dim=-1)
+    target_dist = ((pc_target.unsqueeze(2) - pc_target.unsqueeze(1)) ** 2.0).sum(dim=-1)
+    pred_knn, _ = jt.topk(pred_dist, k=k_pred, dim=-1, largest=False)
+    target_knn, _ = jt.topk(target_dist, k=k_target, dim=-1, largest=False)
+    pred_radius = pred_knn[:, :, 1:].mean(dim=-1)
+    target_radius = target_knn[:, :, 1:].mean(dim=-1)
+    pred_radius_sorted, _ = jt.topk(pred_radius, k=pred_radius.shape[1], dim=-1, largest=False)
+    target_radius_sorted, _ = jt.topk(target_radius, k=target_radius.shape[1], dim=-1, largest=False)
+    m = min(pred_radius_sorted.shape[1], target_radius_sorted.shape[1])
+    return ((pred_radius_sorted[:, :m] - target_radius_sorted[:, :m]) ** 2.0).mean()
+
+
 class CDRefineModule(ModelSpec):
     """
     Second-stage CD-oriented refinement on top of frozen CVM+DM outputs.
@@ -115,6 +139,9 @@ class CDRefineModule(ModelSpec):
         self.point_anchor_weight = cfg.get("point_anchor_weight", 0.05)
         self.surface_anchor_weight = cfg.get("surface_anchor_weight", 0.05)
         self.normal_delta_weight = cfg.get("normal_delta_weight", 0.0)
+        self.density_loss_weight = cfg.get("density_loss_weight", 0.0)
+        self.density_k = cfg.get("density_k", 8)
+        self.density_num_points = cfg.get("density_num_points", self.chamfer_num_points)
         self.allow_direct_refine = cfg.get("allow_direct_refine", False)
         self.target_field = cfg.get("target_field", "pc_clean_corr")
         self.fallback_target_field = cfg.get("fallback_target_field", "pc_clean")
@@ -186,12 +213,21 @@ class CDRefineModule(ModelSpec):
             norm = jt.sqrt((pc_normal_proxy ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
             normal = pc_normal_proxy / norm
             normal_delta = ((delta * normal).sum(dim=-1) ** 2.0).mean()
+        density_loss = 0.0
+        if self.density_loss_weight > 0:
+            density_loss = _density_matching_loss(
+                pc_pred=pc_final,
+                pc_target=pc_target,
+                k=self.density_k,
+                num_points=self.density_num_points,
+            )
         return (
             self.chamfer_loss_weight * chamfer +
             self.residual_anchor_weight * residual_anchor +
             self.point_anchor_weight * point_anchor +
             self.surface_anchor_weight * surface_anchor +
-            self.normal_delta_weight * normal_delta
+            self.normal_delta_weight * normal_delta +
+            self.density_loss_weight * density_loss
         ) / self.dsm_sigma
 
     def _run_stage1(self, pcl_noisy, num_steps: int=None):
