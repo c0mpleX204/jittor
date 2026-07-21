@@ -114,10 +114,13 @@ class CDRefineModule(ModelSpec):
         self.residual_anchor_weight = cfg.get("residual_anchor_weight", 0.02)
         self.point_anchor_weight = cfg.get("point_anchor_weight", 0.05)
         self.surface_anchor_weight = cfg.get("surface_anchor_weight", 0.05)
+        self.normal_delta_weight = cfg.get("normal_delta_weight", 0.0)
         self.allow_direct_refine = cfg.get("allow_direct_refine", False)
         self.target_field = cfg.get("target_field", "pc_clean_corr")
         self.fallback_target_field = cfg.get("fallback_target_field", "pc_clean")
         self.surface_field = cfg.get("surface_field", "pc_clean")
+        self.normal_field = cfg.get("normal_field", "pc_normal")
+        self.normal_source_field = cfg.get("normal_source_field", "pc_noisy")
 
         self.encoder = FeatureExtraction(
             k=self.frame_knn,
@@ -166,7 +169,7 @@ class CDRefineModule(ModelSpec):
         delta = self._predict_delta(pc_stage1)
         return pc_stage1 + delta, delta
 
-    def get_supervised_loss(self, pc_stage1, pc_target, pc_surface=None):
+    def get_supervised_loss(self, pc_stage1, pc_target, pc_surface=None, pc_normal_proxy=None):
         if pc_surface is None:
             pc_surface = pc_target
         pc_final, delta = self.refine(pc_stage1)
@@ -178,11 +181,17 @@ class CDRefineModule(ModelSpec):
         residual_anchor = (delta ** 2.0).sum(dim=-1).mean()
         point_anchor = ((pc_final - pc_target) ** 2.0).sum(dim=-1).mean()
         surface_anchor = ((pc_final - pc_surface) ** 2.0).sum(dim=-1).mean()
+        normal_delta = 0.0
+        if pc_normal_proxy is not None and self.normal_delta_weight > 0:
+            norm = jt.sqrt((pc_normal_proxy ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
+            normal = pc_normal_proxy / norm
+            normal_delta = ((delta * normal).sum(dim=-1) ** 2.0).mean()
         return (
             self.chamfer_loss_weight * chamfer +
             self.residual_anchor_weight * residual_anchor +
             self.point_anchor_weight * point_anchor +
-            self.surface_anchor_weight * surface_anchor
+            self.surface_anchor_weight * surface_anchor +
+            self.normal_delta_weight * normal_delta
         ) / self.dsm_sigma
 
     def _run_stage1(self, pcl_noisy, num_steps: int=None):
@@ -214,10 +223,14 @@ class CDRefineModule(ModelSpec):
         pc_surface = batch.get("pc_surface", None)
         if pc_surface is not None:
             pc_surface = pc_surface.reshape(-1, patch_size, 3)
+        pc_normal_proxy = batch.get("pc_normal_proxy", None)
+        if pc_normal_proxy is not None:
+            pc_normal_proxy = pc_normal_proxy.reshape(-1, patch_size, 3)
         loss = self.get_supervised_loss(
             pc_stage1=pc_stage1,
             pc_target=pc_target,
             pc_surface=pc_surface,
+            pc_normal_proxy=pc_normal_proxy,
         )
         return {"loss": loss}
 
@@ -268,6 +281,13 @@ class CDRefineModule(ModelSpec):
                     d["pc_surface"] = b.meta[self.surface_field]
                 elif "pc_clean" in b.meta:
                     d["pc_surface"] = b.meta["pc_clean"]
+                if self.normal_field in b.meta:
+                    d["pc_normal_proxy"] = b.meta[self.normal_field]
+                elif (
+                    self.normal_source_field in b.meta and
+                    "pc_surface" in d
+                ):
+                    d["pc_normal_proxy"] = b.meta[self.normal_source_field] - d["pc_surface"]
                 for optional_key in ("pc_noisy", "pc_mix", "pc_time"):
                     if optional_key in b.meta:
                         d[optional_key] = b.meta[optional_key]
