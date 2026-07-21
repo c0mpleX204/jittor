@@ -59,8 +59,9 @@ class NpzPatchLazyAsset(LazyAsset):
                 'pc_clean': data['pc_clean'].astype(np.float64),
                 'pc_mix': data['pc_mix'].astype(np.float64),
             }
-            if 'pc_time' in data:
-                meta['pc_time'] = data['pc_time'].astype(np.float64)
+            for optional_key in ('pc_time', 'pc_stage1', 'pc_normal'):
+                if optional_key in data:
+                    meta[optional_key] = data[optional_key].astype(np.float64)
         asset = Asset(
             path=self.path,
             cls=self.cls,
