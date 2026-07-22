@@ -45,6 +45,7 @@ class StraightPCFCoupledVelocityModule(ModelSpec):
         self.num_train_points = cfg.get("num_train_points", 128)
         self.dsm_sigma = cfg.get("dsm_sigma", 0.01)
         self.consistency_loss_weight = cfg.get("consistency_loss_weight", 10.0)
+        self.edge_velocity_anchor_weight = cfg.get("edge_velocity_anchor_weight", 0.0)
 
         velocity_cfg = cfg.get("velocity_model", None)
         if velocity_cfg is None:
@@ -85,7 +86,7 @@ class StraightPCFCoupledVelocityModule(ModelSpec):
             return jt.zeros((batch_size, 1, 1))
         return _clip(pc_time.reshape(batch_size, 1, 1), 0.0, 1.0)
 
-    def get_supervised_loss(self, pc_noisy_l2, pc_clean, pc_time=None):
+    def get_supervised_loss(self, pc_noisy_l2, pc_clean, pc_time=None, pc_edge_risk=None):
         B, N, d = pc_noisy_l2.shape
 
         t = self._time(pc_time, B)
@@ -96,11 +97,15 @@ class StraightPCFCoupledVelocityModule(ModelSpec):
 
         total_dir_loss = 0.0
         total_consistency_loss = 0.0
+        total_edge_anchor = 0.0
 
         for mod, vm in enumerate(self._vms()):
             pred_velocity = self._predict_velocity(vm, pc_state)
             dir_loss = ((pred_velocity - target_velocity) ** 2.0).sum(dim=-1).mean()
             total_dir_loss = total_dir_loss + dir_loss
+            if pc_edge_risk is not None and self.edge_velocity_anchor_weight > 0:
+                edge_anchor = (pc_edge_risk.squeeze(-1) * (pred_velocity ** 2.0).sum(dim=-1)).mean()
+                total_edge_anchor = total_edge_anchor + edge_anchor
 
             pc_state = pc_state + step_ratio.broadcast(pc_state.shape) * pred_velocity
 
@@ -112,7 +117,8 @@ class StraightPCFCoupledVelocityModule(ModelSpec):
 
         return (
             total_dir_loss +
-            self.consistency_loss_weight * total_consistency_loss
+            self.consistency_loss_weight * total_consistency_loss +
+            self.edge_velocity_anchor_weight * total_edge_anchor
         ) / self.dsm_sigma
 
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=None):
@@ -135,10 +141,14 @@ class StraightPCFCoupledVelocityModule(ModelSpec):
         pc_time = batch.get("pc_time", None)
         if pc_time is not None:
             pc_time = pc_time.reshape(-1)
+        pc_edge_risk = batch.get("pc_edge_risk", None)
+        if pc_edge_risk is not None:
+            pc_edge_risk = pc_edge_risk.reshape(-1, patch_size, 1)
         loss = self.get_supervised_loss(
             pc_noisy_l2=pc_noisy_l2,
             pc_clean=pc_clean,
             pc_time=pc_time,
+            pc_edge_risk=pc_edge_risk,
         )
         return {"loss": loss}
 
@@ -174,6 +184,8 @@ class StraightPCFCoupledVelocityModule(ModelSpec):
                 }
                 if "pc_time" in b.meta:
                     d["pc_time"] = b.meta["pc_time"]
+                if "pc_edge_risk" in b.meta:
+                    d["pc_edge_risk"] = b.meta["pc_edge_risk"]
                 res.append(d)
             else:
                 d = {
@@ -210,6 +222,8 @@ class StraightPCFVelocityDistanceModule(ModelSpec):
         self.freeze_velocity = cfg.get("freeze_velocity", False)
         self.velocity_eval_mode = cfg.get("velocity_eval_mode", True)
         self.recompute_ratio_each_iter = cfg.get("recompute_ratio_each_iter", False)
+        self.edge_ratio_anchor_weight = cfg.get("edge_ratio_anchor_weight", 0.0)
+        self.edge_ratio_anchor = cfg.get("edge_ratio_anchor", 0.6)
 
         coupled_cfg = cfg.get("coupled_model", None)
         if coupled_cfg is None:
@@ -302,7 +316,7 @@ class StraightPCFVelocityDistanceModule(ModelSpec):
                 pc_state = pc_state + scale.broadcast(pc_state.shape) * pred_velocity
         return pc_state
 
-    def get_supervised_loss(self, pc_noisy_l2, pc_current, pc_clean, pc_time=None):
+    def get_supervised_loss(self, pc_noisy_l2, pc_current, pc_clean, pc_time=None, pc_edge_risk=None):
         if self.velocity_eval_mode:
             self.coupled_model.eval()
 
@@ -315,6 +329,14 @@ class StraightPCFVelocityDistanceModule(ModelSpec):
         pred_ratio = self.predict_ratio(pc_current)
 
         ratio_loss = ((pred_ratio - target_ratio) ** 2.0).mean()
+        edge_ratio_loss = 0.0
+        if pc_edge_risk is not None and self.edge_ratio_anchor_weight > 0:
+            patch_edge = pc_edge_risk.mean(dim=1, keepdims=True)
+            over_ratio = jt.maximum(
+                pred_ratio - self.edge_ratio_anchor,
+                jt.zeros_like(pred_ratio),
+            )
+            edge_ratio_loss = (patch_edge * (over_ratio ** 2.0)).mean()
         pc_pred = self._apply_coupled_step(
             pc_current=pc_current,
             ratio=pred_ratio,
@@ -324,6 +346,7 @@ class StraightPCFVelocityDistanceModule(ModelSpec):
 
         return (
             self.ratio_loss_weight * ratio_loss +
+            self.edge_ratio_anchor_weight * edge_ratio_loss +
             self.finetune_loss_weight * finetune_loss
         ) / self.dsm_sigma
 
@@ -356,11 +379,15 @@ class StraightPCFVelocityDistanceModule(ModelSpec):
         pc_time = batch.get("pc_time", None)
         if pc_time is not None:
             pc_time = pc_time.reshape(-1)
+        pc_edge_risk = batch.get("pc_edge_risk", None)
+        if pc_edge_risk is not None:
+            pc_edge_risk = pc_edge_risk.reshape(-1, patch_size, 1)
         loss = self.get_supervised_loss(
             pc_noisy_l2=pc_noisy_l2,
             pc_current=pc_current,
             pc_clean=pc_clean,
             pc_time=pc_time,
+            pc_edge_risk=pc_edge_risk,
         )
         return {"loss": loss}
 
@@ -397,6 +424,8 @@ class StraightPCFVelocityDistanceModule(ModelSpec):
                 }
                 if "pc_time" in b.meta:
                     d["pc_time"] = b.meta["pc_time"]
+                if "pc_edge_risk" in b.meta:
+                    d["pc_edge_risk"] = b.meta["pc_edge_risk"]
                 res.append(d)
             else:
                 d = {

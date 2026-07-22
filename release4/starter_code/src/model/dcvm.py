@@ -27,6 +27,7 @@ class DirectionDistanceVelocityModule(ModelSpec):
         self.num_train_points = cfg["num_train_points"]
         self.dsm_sigma = cfg["dsm_sigma"]
         self.denoise_steps = cfg.get("denoise_steps", 4)
+        self.edge_velocity_anchor_weight = cfg.get("edge_velocity_anchor_weight", 0.0)
 
         self.encoder = FeatureExtraction(
             k=self.frame_knn,
@@ -41,7 +42,7 @@ class DirectionDistanceVelocityModule(ModelSpec):
             hidden_size=cfg["decoder_hidden_dim"],
         )
 
-    def get_supervised_loss(self, pc_noisy_l2, pc_current, pc_surface):
+    def get_supervised_loss(self, pc_noisy_l2, pc_current, pc_surface, pc_edge_risk=None):
         """
         pc_noisy_l2: high-noise endpoint, equivalent to StraightPCF pcl_noisy_L2.
         pc_current: t * pc_surface + (1 - t) * pc_noisy_l2.
@@ -55,13 +56,19 @@ class DirectionDistanceVelocityModule(ModelSpec):
         feat = feat[:, pnt_idx, :]
         pc_noisy_l2 = pc_noisy_l2[:, pnt_idx, :]
         pc_surface = pc_surface[:, pnt_idx, :]
+        if pc_edge_risk is not None:
+            pc_edge_risk = pc_edge_risk[:, pnt_idx, :]
 
         target_velocity = pc_surface - pc_noisy_l2
         pred_velocity = self.decoder(
             c=feat.reshape(-1, F_dim)
         ).reshape(B, len(pnt_idx), d)
 
-        return (((pred_velocity - target_velocity) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
+        dir_loss = ((pred_velocity - target_velocity) ** 2.0).sum(dim=-1).mean()
+        edge_anchor = 0.0
+        if pc_edge_risk is not None and self.edge_velocity_anchor_weight > 0:
+            edge_anchor = (pc_edge_risk.squeeze(-1) * (pred_velocity ** 2.0).sum(dim=-1)).mean()
+        return (dir_loss + self.edge_velocity_anchor_weight * edge_anchor) / self.dsm_sigma
 
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=None):
         """
@@ -87,10 +94,14 @@ class DirectionDistanceVelocityModule(ModelSpec):
         pc_noisy_l2 = batch["pc_noisy"].reshape(-1, patch_size, 3)
         pc_current = batch["pc_mix"].reshape(-1, patch_size, 3)
         pc_surface = batch["pc_clean"].reshape(-1, patch_size, 3)
+        pc_edge_risk = batch.get("pc_edge_risk", None)
+        if pc_edge_risk is not None:
+            pc_edge_risk = pc_edge_risk.reshape(-1, patch_size, 1)
         loss = self.get_supervised_loss(
             pc_noisy_l2=pc_noisy_l2,
             pc_current=pc_current,
             pc_surface=pc_surface,
+            pc_edge_risk=pc_edge_risk,
         )
         return {"loss": loss}
 
@@ -120,11 +131,14 @@ class DirectionDistanceVelocityModule(ModelSpec):
         for b in batch:
             if not self.is_predict():
                 assert b.meta is not None
-                res.append({
+                d = {
                     "pc_noisy": b.meta["pc_noisy"],
                     "pc_clean": b.meta["pc_clean"],
                     "pc_mix": b.meta["pc_mix"],
-                })
+                }
+                if "pc_edge_risk" in b.meta:
+                    d["pc_edge_risk"] = b.meta["pc_edge_risk"]
+                res.append(d)
             else:
                 d = {
                     "pc_noisy": b.sampled_vertices_noisy,

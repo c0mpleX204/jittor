@@ -139,6 +139,9 @@ class CDRefineModule(ModelSpec):
         self.point_anchor_weight = cfg.get("point_anchor_weight", 0.05)
         self.surface_anchor_weight = cfg.get("surface_anchor_weight", 0.05)
         self.normal_delta_weight = cfg.get("normal_delta_weight", 0.0)
+        self.edge_point_anchor_weight = cfg.get("edge_point_anchor_weight", 0.0)
+        self.edge_residual_anchor_weight = cfg.get("edge_residual_anchor_weight", 0.0)
+        self.edge_normal_delta_weight = cfg.get("edge_normal_delta_weight", 0.0)
         self.density_loss_weight = cfg.get("density_loss_weight", 0.0)
         self.density_k = cfg.get("density_k", 8)
         self.density_num_points = cfg.get("density_num_points", self.chamfer_num_points)
@@ -196,7 +199,7 @@ class CDRefineModule(ModelSpec):
         delta = self._predict_delta(pc_stage1)
         return pc_stage1 + delta, delta
 
-    def get_supervised_loss(self, pc_stage1, pc_target, pc_surface=None, pc_normal_proxy=None):
+    def get_supervised_loss(self, pc_stage1, pc_target, pc_surface=None, pc_normal_proxy=None, pc_edge_risk=None):
         if pc_surface is None:
             pc_surface = pc_target
         pc_final, delta = self.refine(pc_stage1)
@@ -213,6 +216,26 @@ class CDRefineModule(ModelSpec):
             norm = jt.sqrt((pc_normal_proxy ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
             normal = pc_normal_proxy / norm
             normal_delta = ((delta * normal).sum(dim=-1) ** 2.0).mean()
+        edge_point_anchor = 0.0
+        edge_residual_anchor = 0.0
+        edge_normal_delta = 0.0
+        if pc_edge_risk is not None:
+            edge_risk = pc_edge_risk.squeeze(-1)
+            if self.edge_point_anchor_weight > 0:
+                edge_point_anchor = (
+                    edge_risk * ((pc_final - pc_target) ** 2.0).sum(dim=-1)
+                ).mean()
+            if self.edge_residual_anchor_weight > 0:
+                edge_residual_anchor = (edge_risk * (delta ** 2.0).sum(dim=-1)).mean()
+            if (
+                pc_normal_proxy is not None and
+                self.edge_normal_delta_weight > 0
+            ):
+                norm = jt.sqrt((pc_normal_proxy ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
+                normal = pc_normal_proxy / norm
+                edge_normal_delta = (
+                    edge_risk * ((delta * normal).sum(dim=-1) ** 2.0)
+                ).mean()
         density_loss = 0.0
         if self.density_loss_weight > 0:
             density_loss = _density_matching_loss(
@@ -227,6 +250,9 @@ class CDRefineModule(ModelSpec):
             self.point_anchor_weight * point_anchor +
             self.surface_anchor_weight * surface_anchor +
             self.normal_delta_weight * normal_delta +
+            self.edge_point_anchor_weight * edge_point_anchor +
+            self.edge_residual_anchor_weight * edge_residual_anchor +
+            self.edge_normal_delta_weight * edge_normal_delta +
             self.density_loss_weight * density_loss
         ) / self.dsm_sigma
 
@@ -262,11 +288,15 @@ class CDRefineModule(ModelSpec):
         pc_normal_proxy = batch.get("pc_normal_proxy", None)
         if pc_normal_proxy is not None:
             pc_normal_proxy = pc_normal_proxy.reshape(-1, patch_size, 3)
+        pc_edge_risk = batch.get("pc_edge_risk", None)
+        if pc_edge_risk is not None:
+            pc_edge_risk = pc_edge_risk.reshape(-1, patch_size, 1)
         loss = self.get_supervised_loss(
             pc_stage1=pc_stage1,
             pc_target=pc_target,
             pc_surface=pc_surface,
             pc_normal_proxy=pc_normal_proxy,
+            pc_edge_risk=pc_edge_risk,
         )
         return {"loss": loss}
 
@@ -324,6 +354,8 @@ class CDRefineModule(ModelSpec):
                     "pc_surface" in d
                 ):
                     d["pc_normal_proxy"] = b.meta[self.normal_source_field] - d["pc_surface"]
+                if "pc_edge_risk" in b.meta:
+                    d["pc_edge_risk"] = b.meta["pc_edge_risk"]
                 for optional_key in ("pc_noisy", "pc_mix", "pc_time"):
                     if optional_key in b.meta:
                         d[optional_key] = b.meta[optional_key]

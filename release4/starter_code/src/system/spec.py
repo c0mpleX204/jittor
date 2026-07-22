@@ -74,6 +74,8 @@ class DummySystem():
         if trainer_config is None:
             trainer_config = {}
         self.epochs = trainer_config.get('epochs', 1)
+        self.ckpt_interval_steps = trainer_config.get('ckpt_interval_steps', 0)
+        self.global_step = 0
         
         if optimizer_config is not None and model is not None:
             self.optimizer = get_optimizer(optimizer_config, model)
@@ -181,6 +183,15 @@ class DummySystem():
                 pbar.set_description(f"Epoch {epoch}, Loss: {_get_item(loss)}")
                 self.on_before_optimizer_step(self.optimizer)
                 self.optimizer.step()
+                self.global_step += 1
+                if self.ckpt_interval_steps and self.global_step % self.ckpt_interval_steps == 0:
+                    checkpoint_path = os.path.join(
+                        self.ckpt_save_dir,
+                        f'{self.ckpt_save_name}_step_{self.global_step}.pkl',
+                    )
+                    os.makedirs(self.ckpt_save_dir, exist_ok=True)
+                    self.model.save(checkpoint_path)
+                    _sync_jittor()
                 self.on_train_batch_end()
             self.on_train_epoch_end()
             _sync_jittor()

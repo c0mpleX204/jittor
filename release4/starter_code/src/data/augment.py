@@ -49,6 +49,45 @@ def _ensure_noisy_if_missing(asset: Asset, pc):
     if asset.sampled_vertices_noisy is None:
         asset.sampled_vertices_noisy = pc.copy()
 
+
+def _normalize01(x: np.ndarray) -> np.ndarray:
+    lo = np.percentile(x, 75.0)
+    hi = np.percentile(x, 98.0)
+    if hi <= lo + 1e-12:
+        hi = float(np.max(x))
+    if hi <= lo + 1e-12:
+        return np.zeros_like(x, dtype=np.float32)
+    return np.clip((x - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+
+def _patch_pca_risk_and_normal(patches: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    risks = []
+    normals = []
+    for patch in patches:
+        n = patch.shape[0]
+        kk = max(4, min(k, n))
+        _, nn_idx = cKDTree(patch).query(patch, k=kk)
+        patch_normal = np.zeros((n, 3), dtype=np.float32)
+        curvatures = np.zeros((n,), dtype=np.float32)
+        linearities = np.zeros((n,), dtype=np.float32)
+        for i in range(n):
+            neigh = patch[nn_idx[i]]
+            centered = neigh - neigh.mean(axis=0, keepdims=True)
+            cov = np.matmul(centered.T, centered) / max(len(neigh) - 1, 1)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            eigvals = np.maximum(eigvals, 0.0)
+            total = float(eigvals.sum()) + 1e-12
+            curvatures[i] = eigvals[0] / total
+            linearities[i] = (eigvals[2] - eigvals[1]) / (eigvals[2] + 1e-12)
+            patch_normal[i] = eigvecs[:, 0]
+        patch_risk = np.maximum(
+            _normalize01(curvatures),
+            _normalize01(linearities),
+        )
+        risks.append(patch_risk[:, None])
+        normals.append(patch_normal)
+    return np.stack(risks, axis=0), np.stack(normals, axis=0)
+
 @dataclass(frozen=True)
 class Augment(ConfigSpec):
     
@@ -332,6 +371,10 @@ class AugmentPatch(Augment):
     surface_target: bool=False
 
     use_noisy_l2: bool=False
+
+    edge_risk: bool=False
+
+    edge_risk_k: int=16
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentPatch':
@@ -386,6 +429,11 @@ class AugmentPatch(Augment):
         pat_B = pat_B - seed_points_t
         pat_t = pat_t - seed_points_t
         pat_clean_corr = pat_clean_corr - seed_points_t
+        if self.edge_risk:
+            pc_edge_risk, pc_normal = _patch_pca_risk_and_normal(
+                patches=pat_B,
+                k=self.edge_risk_k,
+            )
         
         if asset.meta is None:
             asset.meta = {}
@@ -393,6 +441,9 @@ class AugmentPatch(Augment):
         asset.meta['pc_clean'] = pat_B
         asset.meta['pc_clean_corr'] = pat_clean_corr
         asset.meta['pc_mix'] = pat_t
+        if self.edge_risk:
+            asset.meta['pc_edge_risk'] = pc_edge_risk
+            asset.meta['pc_normal'] = pc_normal
         if self.straight_time:
             asset.meta['pc_time'] = t[:, 0, 0]
 
