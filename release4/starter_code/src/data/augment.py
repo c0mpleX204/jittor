@@ -67,19 +67,15 @@ def _patch_pca_risk_and_normal(patches: np.ndarray, k: int) -> Tuple[np.ndarray,
         n = patch.shape[0]
         kk = max(4, min(k, n))
         _, nn_idx = cKDTree(patch).query(patch, k=kk)
-        patch_normal = np.zeros((n, 3), dtype=np.float32)
-        curvatures = np.zeros((n,), dtype=np.float32)
-        linearities = np.zeros((n,), dtype=np.float32)
-        for i in range(n):
-            neigh = patch[nn_idx[i]]
-            centered = neigh - neigh.mean(axis=0, keepdims=True)
-            cov = np.matmul(centered.T, centered) / max(len(neigh) - 1, 1)
-            eigvals, eigvecs = np.linalg.eigh(cov)
-            eigvals = np.maximum(eigvals, 0.0)
-            total = float(eigvals.sum()) + 1e-12
-            curvatures[i] = eigvals[0] / total
-            linearities[i] = (eigvals[2] - eigvals[1]) / (eigvals[2] + 1e-12)
-            patch_normal[i] = eigvecs[:, 0]
+        neigh = patch[nn_idx]
+        centered = neigh - neigh.mean(axis=1, keepdims=True)
+        cov = np.einsum("nki,nkj->nij", centered, centered) / max(kk - 1, 1)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        eigvals = np.maximum(eigvals, 0.0)
+        total = eigvals.sum(axis=1) + 1e-12
+        curvatures = eigvals[:, 0] / total
+        linearities = (eigvals[:, 2] - eigvals[:, 1]) / (eigvals[:, 2] + 1e-12)
+        patch_normal = eigvecs[:, :, 0].astype(np.float32)
         patch_risk = np.maximum(
             _normalize01(curvatures),
             _normalize01(linearities),
