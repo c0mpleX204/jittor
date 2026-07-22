@@ -148,16 +148,27 @@ class AugmentAddNoise(Augment):
     
     noise_std_max: float
 
-    noise_type: str="laplace"
+    noise_type: Union[str, Tuple[str, ...]]="laplace"
+
+    noise_probs: Optional[Tuple[float, ...]]=None
 
     enabled: bool=True
 
     l2_noise_std: Optional[float]=None
 
+    l2_noise_std_min: Optional[float]=None
+
+    l2_noise_std_max: Optional[float]=None
+
     use_l2_as_noisy: bool=False
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentAddNoise':
+        kwargs = deepcopy(kwargs)
+        if "noise_type" in kwargs:
+            kwargs["noise_type"] = _as_tuple(kwargs["noise_type"])
+        if kwargs.get("noise_probs") is not None:
+            kwargs["noise_probs"] = _as_tuple(kwargs["noise_probs"])
         cls.check_keys(kwargs)
         return AugmentAddNoise(**kwargs)
     
@@ -168,10 +179,14 @@ class AugmentAddNoise(Augment):
             _ensure_noisy_if_missing(asset, pc)
             return
         noise_std = np.random.uniform(self.noise_std_min, self.noise_std_max)
-        noise = _sample_noise(self.noise_type, noise_std, pc.shape)
+        noise_type = _choose_noise_type(self.noise_type, self.noise_probs)
+        noise = _sample_noise(noise_type, noise_std, pc.shape)
         asset.sampled_vertices_noisy = pc + noise
-        if self.l2_noise_std is not None:
-            noise_l2 = _sample_noise(self.noise_type, self.l2_noise_std, pc.shape)
+        l2_noise_std = self.l2_noise_std
+        if self.l2_noise_std_min is not None and self.l2_noise_std_max is not None:
+            l2_noise_std = np.random.uniform(self.l2_noise_std_min, self.l2_noise_std_max)
+        if l2_noise_std is not None:
+            noise_l2 = _sample_noise(noise_type, l2_noise_std, pc.shape)
             pc_noisy_l2 = pc + noise_l2
             if asset.meta is None:
                 asset.meta = {}
@@ -375,6 +390,12 @@ class AugmentPatch(Augment):
     edge_risk: bool=False
 
     edge_risk_k: int=16
+
+    edge_seed_candidate_multiplier: int=1
+
+    edge_seed_prob: float=0.0
+
+    edge_seed_score_percentile: float=90.0
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentPatch':
@@ -393,7 +414,15 @@ class AugmentPatch(Augment):
         
         N = pc_noisy.shape[0]
         
-        seed_idx = np.random.permutation(N)[:self.num_patches]   # (P,)
+        num_candidates = self.num_patches
+        if (
+            self.edge_risk and
+            self.edge_seed_candidate_multiplier > 1 and
+            np.random.rand() < self.edge_seed_prob
+        ):
+            num_candidates = min(N, self.num_patches * self.edge_seed_candidate_multiplier)
+
+        seed_idx = np.random.permutation(N)[:num_candidates]     # (P,)
         seed_points = pc_noisy[seed_idx]                         # (P, 3)
         
         tree = cKDTree(pc_noisy)
@@ -404,7 +433,7 @@ class AugmentPatch(Augment):
         if self.surface_target:
             clean_tree = cKDTree(pc)
             _, surface_idx = clean_tree.query(pat_A.reshape(-1, 3), k=1)
-            pat_B = pc[surface_idx].reshape(self.num_patches, self.patch_size, 3)
+            pat_B = pc[surface_idx].reshape(num_candidates, self.patch_size, 3)
             _, seed_surface_idx = clean_tree.query(seed_points, k=1)
             seed_targets = pc[seed_surface_idx]
         else:
@@ -413,10 +442,10 @@ class AugmentPatch(Augment):
 
         l1, l2 = 1e-8, 1.0
         if self.straight_time:
-            t = np.random.rand(self.num_patches, 1, 1)
-            t = np.broadcast_to(t, (self.num_patches, self.patch_size, 1))
+            t = np.random.rand(num_candidates, 1, 1)
+            t = np.broadcast_to(t, (num_candidates, self.patch_size, 1))
         else:
-            t = np.random.rand(self.num_patches, self.patch_size, 1)
+            t = np.random.rand(num_candidates, self.patch_size, 1)
         t = (l2 - l1) * t + l1
         
         pat_t = t * pat_B + (1 - t) * pat_A
@@ -434,6 +463,21 @@ class AugmentPatch(Augment):
                 patches=pat_B,
                 k=self.edge_risk_k,
             )
+            if num_candidates > self.num_patches:
+                patch_score = np.percentile(
+                    pc_edge_risk[:, :, 0],
+                    self.edge_seed_score_percentile,
+                    axis=1,
+                )
+                select_idx = np.argsort(patch_score)[-self.num_patches:]
+                select_idx = np.sort(select_idx)
+                pat_A = pat_A[select_idx]
+                pat_B = pat_B[select_idx]
+                pat_t = pat_t[select_idx]
+                pat_clean_corr = pat_clean_corr[select_idx]
+                pc_edge_risk = pc_edge_risk[select_idx]
+                pc_normal = pc_normal[select_idx]
+                t = t[select_idx]
         
         if asset.meta is None:
             asset.meta = {}
