@@ -3,8 +3,9 @@ from typing import Dict, List, Optional
 
 import jittor as jt
 import numpy as np
+from jittor import nn
 
-from .feature import Decoder, FeatureExtraction
+from .feature import Decoder, FeatureExtraction, get_knn_idx
 from .spec import ModelSpec
 from .straightpcf_vm_dm import StraightPCFVelocityDistanceModule
 from .vm import patch_based_denoise
@@ -109,6 +110,116 @@ def _density_matching_loss(pc_pred, pc_target, k: int, num_points: Optional[int]
     return ((pred_radius_sorted[:, :m] - target_radius_sorted[:, :m]) ** 2.0).mean()
 
 
+class LocalFeatureAttention(nn.Module):
+    def __init__(
+        self,
+        feat_dim: int,
+        k: int,
+        hidden_dim: int,
+        residual_scale: float=1.0,
+        use_edge_risk: bool=True,
+    ):
+        super().__init__()
+        self.k = k
+        self.feat_dim = feat_dim
+        self.residual_scale = residual_scale
+        self.use_edge_risk = use_edge_risk
+        score_dim = 2 * feat_dim + 7
+        value_dim = feat_dim + 4
+        self.score_mlp = nn.Sequential(
+            nn.Linear(score_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.value_mlp = nn.Sequential(
+            nn.Linear(value_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, feat_dim),
+        )
+        self.out_proj = nn.Sequential(
+            nn.Linear(2 * feat_dim, feat_dim),
+            nn.ReLU(),
+            nn.Linear(feat_dim, feat_dim),
+        )
+
+    def _edge_index(self, pc, k: int):
+        B, N, _ = pc.shape
+        knn_idx = get_knn_idx(pc, pc, k, offset=1)
+        base = jt.arange(B) * N
+        base = base.reshape(B, 1, 1)
+        knn_idx = knn_idx + base
+
+        dst = jt.arange(N)
+        dst = dst.reshape(1, N, 1).broadcast((B, N, k))
+        dst = dst + base
+        return knn_idx.reshape(-1), dst.reshape(-1)
+
+    def _radius_risk(self, radius):
+        mean = radius.mean(dim=1, keepdims=True)
+        var = ((radius - mean) ** 2.0).mean(dim=1, keepdims=True)
+        return jt.sigmoid((radius - mean) / jt.sqrt(var + 1e-8))
+
+    def execute(self, pc, feat, pc_edge_risk=None):
+        B, N, _ = pc.shape
+        if N <= 1 or self.k <= 0:
+            return feat
+
+        k = min(self.k, N - 1)
+        src, dst = self._edge_index(pc, k)
+        feat_flat = feat.reshape(B * N, self.feat_dim)
+        pc_flat = pc.reshape(B * N, 3)
+
+        feat_i = feat_flat[dst]
+        feat_j = feat_flat[src]
+        pos_delta = pc_flat[src] - pc_flat[dst]
+        dist2 = (pos_delta ** 2.0).sum(dim=1, keepdims=True)
+
+        radius_flat = jt.full((B * N, 1), 0.0)
+        radius_flat = radius_flat.scatter_(
+            0,
+            dst.unsqueeze(1).broadcast(dist2.shape),
+            dist2,
+            reduce='add',
+        )
+        radius = (radius_flat / float(k)).reshape(B, N, 1)
+        risk = self._radius_risk(radius)
+        if self.use_edge_risk and pc_edge_risk is not None:
+            risk = pc_edge_risk
+        risk_flat = risk.reshape(B * N, 1)
+        risk_i = risk_flat[dst]
+        risk_j = risk_flat[src]
+        risk_diff2 = (risk_i - risk_j) ** 2.0
+
+        score_input = jt.concat(
+            [feat_i, feat_j, pos_delta, dist2, risk_i, risk_j, risk_diff2],
+            dim=1,
+        )
+        score = jt.sigmoid(self.score_mlp(score_input))
+
+        value_input = jt.concat([feat_j, pos_delta, risk_j], dim=1)
+        value = self.value_mlp(value_input)
+        weighted = score * value
+
+        agg = jt.full((B * N, self.feat_dim), 0.0)
+        denom = jt.full((B * N, 1), 0.0)
+        agg = agg.scatter_(
+            0,
+            dst.unsqueeze(1).broadcast(weighted.shape),
+            weighted,
+            reduce='add',
+        )
+        denom = denom.scatter_(
+            0,
+            dst.unsqueeze(1).broadcast(score.shape),
+            score,
+            reduce='add',
+        )
+        agg = agg / (denom + 1e-6)
+        agg = agg.reshape(B, N, self.feat_dim)
+        refined = self.out_proj(jt.concat([feat, agg], dim=-1))
+        return feat + self.residual_scale * refined
+
+
 class CDRefineModule(ModelSpec):
     """
     Second-stage CD-oriented refinement on top of frozen CVM+DM outputs.
@@ -151,6 +262,7 @@ class CDRefineModule(ModelSpec):
         self.surface_field = cfg.get("surface_field", "pc_clean")
         self.normal_field = cfg.get("normal_field", "pc_normal")
         self.normal_source_field = cfg.get("normal_source_field", "pc_noisy")
+        self.use_local_attention = cfg.get("use_local_attention", False)
 
         self.encoder = FeatureExtraction(
             k=self.frame_knn,
@@ -164,6 +276,15 @@ class CDRefineModule(ModelSpec):
             out_dim=3,
             hidden_size=self.decoder_hidden_dim,
         )
+        self.local_attention = None
+        if self.use_local_attention:
+            self.local_attention = LocalFeatureAttention(
+                feat_dim=self.encoder.embedding_dim,
+                k=cfg.get("attention_k", self.frame_knn),
+                hidden_dim=cfg.get("attention_hidden_dim", self.decoder_hidden_dim),
+                residual_scale=cfg.get("attention_residual_scale", 1.0),
+                use_edge_risk=cfg.get("attention_use_edge_risk", True),
+            )
 
         self.stage1_ckpt = cfg.get("stage1_ckpt", cfg.get("cvm_dm_ckpt", None))
         self.stage1_model = None
@@ -186,23 +307,25 @@ class CDRefineModule(ModelSpec):
             if hasattr(param, "requires_grad"):
                 param.requires_grad = False
 
-    def _predict_delta(self, pc_stage1):
+    def _predict_delta(self, pc_stage1, pc_edge_risk=None):
         B, N, d = pc_stage1.shape
         feat = self.encoder(pc_stage1)
+        if self.local_attention is not None:
+            feat = self.local_attention(pc_stage1, feat, pc_edge_risk=pc_edge_risk)
         F_dim = feat.shape[-1]
         raw_delta = self.decoder(
             c=feat.reshape(-1, F_dim),
         ).reshape(B, N, d)
         return self.delta_scale * jt.tanh(raw_delta)
 
-    def refine(self, pc_stage1):
-        delta = self._predict_delta(pc_stage1)
+    def refine(self, pc_stage1, pc_edge_risk=None):
+        delta = self._predict_delta(pc_stage1, pc_edge_risk=pc_edge_risk)
         return pc_stage1 + delta, delta
 
     def get_supervised_loss(self, pc_stage1, pc_target, pc_surface=None, pc_normal_proxy=None, pc_edge_risk=None):
         if pc_surface is None:
             pc_surface = pc_target
-        pc_final, delta = self.refine(pc_stage1)
+        pc_final, delta = self.refine(pc_stage1, pc_edge_risk=pc_edge_risk)
         chamfer = _chamfer_loss(
             pc_pred=pc_final,
             pc_target=pc_target,
@@ -372,3 +495,19 @@ class CDRefineModule(ModelSpec):
 
 class TangentialCDRefineModule(CDRefineModule):
     pass
+
+
+class LocalAttentionCDRefineModule(CDRefineModule):
+    def __init__(self, model_config, transform_config):
+        cfg = deepcopy(model_config)
+        cfg.setdefault("use_local_attention", True)
+        cfg.setdefault("attention_use_edge_risk", False)
+        super().__init__(cfg, transform_config)
+
+
+class RiskAwareCDRefineModule(CDRefineModule):
+    def __init__(self, model_config, transform_config):
+        cfg = deepcopy(model_config)
+        cfg.setdefault("use_local_attention", True)
+        cfg.setdefault("attention_use_edge_risk", True)
+        super().__init__(cfg, transform_config)
