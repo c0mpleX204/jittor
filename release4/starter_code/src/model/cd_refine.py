@@ -77,6 +77,63 @@ def _sample_points(pc, num_points: Optional[int]):
     return pc[:, idx, :]
 
 
+def _sample_points_pair_with_extra(pc_a, pc_b, extra, num_points: Optional[int]):
+    idx = _random_indices(pc_a.shape[1], num_points)
+    if idx is None:
+        return pc_a, pc_b, extra
+    return pc_a[:, idx, :], pc_b[:, idx, :], extra[:, idx, :]
+
+
+def _clamp01(x):
+    return jt.minimum(jt.maximum(x, jt.ones_like(x) * 0.0), jt.ones_like(x))
+
+
+def _normalize_vectors(x):
+    return x / jt.sqrt((x ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
+
+
+def _cross(a, b):
+    return jt.stack(
+        [
+            a[..., 1] * b[..., 2] - a[..., 2] * b[..., 1],
+            a[..., 2] * b[..., 0] - a[..., 0] * b[..., 2],
+            a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0],
+        ],
+        dim=-1,
+    )
+
+
+def _knn_neighbors(pc, k: int):
+    B, N, _ = pc.shape
+    k = min(k, N - 1)
+    if k <= 0:
+        return None
+    idx = get_knn_idx(pc, pc, k, offset=1)
+    base = (jt.arange(B) * N).reshape(B, 1, 1)
+    idx_flat = (idx + base).reshape(-1)
+    pc_flat = pc.reshape(B * N, 3)
+    return pc_flat[idx_flat].reshape(B, N, k, 3)
+
+
+def _radius_risk_from_neighbors(pc, neighbors):
+    delta = neighbors - pc.unsqueeze(2)
+    dist2 = (delta ** 2.0).sum(dim=-1)
+    radius = dist2.mean(dim=-1, keepdims=True)
+    mean = radius.mean(dim=1, keepdims=True)
+    var = ((radius - mean) ** 2.0).mean(dim=1, keepdims=True)
+    return jt.sigmoid((radius - mean) / jt.sqrt(var + 1e-8))
+
+
+def _cross_normal_from_neighbors(pc, neighbors):
+    k = neighbors.shape[2]
+    if k < 2:
+        return None
+    v1 = neighbors[:, :, 0, :] - pc
+    v2 = neighbors[:, :, k // 2, :] - pc
+    normal = _cross(v1, v2)
+    return _normalize_vectors(normal)
+
+
 def _chamfer_loss(pc_pred, pc_target, num_points: Optional[int]):
     pc_pred = _sample_points(pc_pred, num_points)
     pc_target = _sample_points(pc_target, num_points)
@@ -92,6 +149,36 @@ def _one_sided_nn_loss(pc_pred, pc_target, num_points: Optional[int]):
     dist = ((pc_pred.unsqueeze(2) - pc_target.unsqueeze(1)) ** 2.0).sum(dim=-1)
     pred_to_target, _ = jt.topk(dist, k=1, dim=2, largest=False)
     return pred_to_target.mean()
+
+
+def _weighted_chamfer_loss(
+    pc_pred,
+    pc_target,
+    weights,
+    num_points: Optional[int],
+    weight_power: float=1.0,
+):
+    pc_pred, pc_target, weights = _sample_points_pair_with_extra(
+        pc_pred,
+        pc_target,
+        weights,
+        num_points,
+    )
+    dist = ((pc_pred.unsqueeze(2) - pc_target.unsqueeze(1)) ** 2.0).sum(dim=-1)
+    pred_to_target, _ = jt.topk(dist, k=1, dim=2, largest=False)
+    target_to_pred, _ = jt.topk(dist, k=1, dim=1, largest=False)
+
+    B = pc_pred.shape[0]
+    weights = _clamp01(weights).reshape(B, -1)
+    if weight_power != 1.0:
+        weights = weights ** float(weight_power)
+
+    pred_to_target = pred_to_target.reshape(B, -1)
+    target_to_pred = target_to_pred.reshape(B, -1)
+    weight_sum = weights.sum() + 1e-6
+    pred_loss = (pred_to_target * weights).sum() / weight_sum
+    target_loss = (target_to_pred * weights).sum() / weight_sum
+    return pred_loss + target_loss
 
 
 def _density_matching_loss(pc_pred, pc_target, k: int, num_points: Optional[int]):
@@ -126,12 +213,18 @@ class LocalFeatureAttention(nn.Module):
         hidden_dim: int,
         residual_scale: float=1.0,
         use_edge_risk: bool=True,
+        use_geometry_gate: bool=False,
+        geometry_gate_floor: float=0.25,
+        geometry_gate_strength: float=2.0,
     ):
         super().__init__()
         self.k = k
         self.feat_dim = feat_dim
         self.residual_scale = residual_scale
         self.use_edge_risk = use_edge_risk
+        self.use_geometry_gate = use_geometry_gate
+        self.geometry_gate_floor = geometry_gate_floor
+        self.geometry_gate_strength = geometry_gate_strength
         score_dim = 2 * feat_dim + 7
         value_dim = feat_dim + 4
         self.score_mlp = nn.Sequential(
@@ -167,7 +260,7 @@ class LocalFeatureAttention(nn.Module):
         var = ((radius - mean) ** 2.0).mean(dim=1, keepdims=True)
         return jt.sigmoid((radius - mean) / jt.sqrt(var + 1e-8))
 
-    def execute(self, pc, feat, pc_edge_risk=None):
+    def execute(self, pc, feat, pc_edge_risk=None, pc_normal_proxy=None):
         B, N, _ = pc.shape
         if N <= 1 or self.k <= 0:
             return feat
@@ -203,6 +296,23 @@ class LocalFeatureAttention(nn.Module):
             dim=1,
         )
         score = jt.sigmoid(self.score_mlp(score_input))
+        if self.use_geometry_gate and pc_normal_proxy is not None:
+            normal_flat = _normalize_vectors(pc_normal_proxy).reshape(B * N, 3)
+            normal_i = normal_flat[dst]
+            normal_j = normal_flat[src]
+            normal_align = (normal_i * normal_j).sum(dim=1, keepdims=True) ** 2.0
+            normal_mismatch = 1.0 - _clamp01(normal_align)
+            gap_i = jt.sqrt(((pos_delta * normal_i).sum(dim=1, keepdims=True) ** 2.0) + 1e-12)
+            gap_j = jt.sqrt(((pos_delta * normal_j).sum(dim=1, keepdims=True) ** 2.0) + 1e-12)
+            side_gap = _clamp01((gap_i + gap_j) / (jt.sqrt(dist2 + 1e-12) + 1e-6))
+            pair_risk = jt.maximum(risk_i, risk_j)
+            geometry_penalty = pair_risk * (normal_mismatch + side_gap)
+            gate = (
+                float(self.geometry_gate_floor) +
+                (1.0 - float(self.geometry_gate_floor)) *
+                jt.exp(-float(self.geometry_gate_strength) * geometry_penalty)
+            )
+            score = score * gate
 
         value_input = jt.concat([feat_j, pos_delta, risk_j], dim=1)
         value = self.value_mlp(value_input)
@@ -265,6 +375,11 @@ class CDRefineModule(ModelSpec):
         self.edge_residual_anchor_weight = cfg.get("edge_residual_anchor_weight", 0.0)
         self.edge_normal_delta_weight = cfg.get("edge_normal_delta_weight", 0.0)
         self.edge_tangent_delta_weight = cfg.get("edge_tangent_delta_weight", 0.0)
+        self.edge_chamfer_loss_weight = cfg.get("edge_chamfer_loss_weight", 0.0)
+        self.edge_chamfer_num_points = cfg.get("edge_chamfer_num_points", self.chamfer_num_points)
+        self.edge_chamfer_risk_power = cfg.get("edge_chamfer_risk_power", 1.0)
+        self.edge_delta_scale = cfg.get("edge_delta_scale", None)
+        self.edge_delta_risk_power = cfg.get("edge_delta_risk_power", 1.0)
         self.density_loss_weight = cfg.get("density_loss_weight", 0.0)
         self.density_k = cfg.get("density_k", 8)
         self.density_num_points = cfg.get("density_num_points", self.chamfer_num_points)
@@ -280,6 +395,8 @@ class CDRefineModule(ModelSpec):
         self.predict_patch_seed_k_alpha = cfg.get("predict_patch_seed_k_alpha", 1)
         self.predict_patch_aggregation = cfg.get("predict_patch_aggregation", "best")
         self.predict_patch_weight_temperature = cfg.get("predict_patch_weight_temperature", 1.0)
+        self.predict_runtime_edge_risk = cfg.get("predict_runtime_edge_risk", False)
+        self.runtime_edge_k = cfg.get("runtime_edge_k", self.frame_knn)
 
         self.encoder = FeatureExtraction(
             k=self.frame_knn,
@@ -301,6 +418,9 @@ class CDRefineModule(ModelSpec):
                 hidden_dim=cfg.get("attention_hidden_dim", self.decoder_hidden_dim),
                 residual_scale=cfg.get("attention_residual_scale", 1.0),
                 use_edge_risk=cfg.get("attention_use_edge_risk", True),
+                use_geometry_gate=cfg.get("attention_use_geometry_gate", False),
+                geometry_gate_floor=cfg.get("attention_geometry_gate_floor", 0.25),
+                geometry_gate_strength=cfg.get("attention_geometry_gate_strength", 2.0),
             )
 
         self.stage1_ckpt = cfg.get("stage1_ckpt", cfg.get("cvm_dm_ckpt", None))
@@ -324,25 +444,60 @@ class CDRefineModule(ModelSpec):
             if hasattr(param, "requires_grad"):
                 param.requires_grad = False
 
-    def _predict_delta(self, pc_stage1, pc_edge_risk=None):
+    def _estimate_runtime_geometry(self, pc_stage1):
+        if not self.predict_runtime_edge_risk:
+            return None, None
+        if pc_stage1.shape[1] <= 2:
+            return None, None
+        neighbors = _knn_neighbors(pc_stage1, self.runtime_edge_k)
+        if neighbors is None:
+            return None, None
+        pc_edge_risk = _radius_risk_from_neighbors(pc_stage1, neighbors)
+        pc_normal_proxy = _cross_normal_from_neighbors(pc_stage1, neighbors)
+        return pc_edge_risk, pc_normal_proxy
+
+    def _predict_delta(self, pc_stage1, pc_edge_risk=None, pc_normal_proxy=None):
         B, N, d = pc_stage1.shape
         feat = self.encoder(pc_stage1)
         if self.local_attention is not None:
-            feat = self.local_attention(pc_stage1, feat, pc_edge_risk=pc_edge_risk)
+            feat = self.local_attention(
+                pc_stage1,
+                feat,
+                pc_edge_risk=pc_edge_risk,
+                pc_normal_proxy=pc_normal_proxy,
+            )
         F_dim = feat.shape[-1]
         raw_delta = self.decoder(
             c=feat.reshape(-1, F_dim),
         ).reshape(B, N, d)
-        return self.delta_scale * jt.tanh(raw_delta)
+        delta_unit = jt.tanh(raw_delta)
+        if self.edge_delta_scale is not None and pc_edge_risk is not None:
+            edge_risk = _clamp01(pc_edge_risk)
+            if self.edge_delta_risk_power != 1.0:
+                edge_risk = edge_risk ** float(self.edge_delta_risk_power)
+            scale = (
+                float(self.delta_scale) +
+                edge_risk * (float(self.edge_delta_scale) - float(self.delta_scale))
+            )
+            return scale * delta_unit
+        return self.delta_scale * delta_unit
 
-    def refine(self, pc_stage1, pc_edge_risk=None):
-        delta = self._predict_delta(pc_stage1, pc_edge_risk=pc_edge_risk)
+    def refine(self, pc_stage1, pc_edge_risk=None, pc_normal_proxy=None):
+        delta = self._predict_delta(
+            pc_stage1,
+            pc_edge_risk=pc_edge_risk,
+            pc_normal_proxy=pc_normal_proxy,
+        )
         return pc_stage1 + delta, delta
 
     def get_supervised_loss(self, pc_stage1, pc_target, pc_surface=None, pc_normal_proxy=None, pc_edge_risk=None):
         if pc_surface is None:
             pc_surface = pc_target
-        pc_final, delta = self.refine(pc_stage1, pc_edge_risk=pc_edge_risk)
+        pc_final, delta = self.refine(
+            pc_stage1,
+            pc_edge_risk=pc_edge_risk,
+            pc_normal_proxy=pc_normal_proxy,
+        )
         chamfer = _chamfer_loss(
             pc_pred=pc_final,
             pc_target=pc_target,
@@ -357,6 +512,15 @@ class CDRefineModule(ModelSpec):
                 pc_pred=pc_final,
                 pc_target=pc_surface,
                 num_points=self.surface_set_num_points,
+            )
+        edge_chamfer = 0.0
+        if self.edge_chamfer_loss_weight > 0 and pc_edge_risk is not None:
+            edge_chamfer = _weighted_chamfer_loss(
+                pc_pred=pc_final,
+                pc_target=pc_target,
+                weights=pc_edge_risk,
+                num_points=self.edge_chamfer_num_points,
+                weight_power=self.edge_chamfer_risk_power,
             )
 
         normal = None
@@ -418,6 +582,7 @@ class CDRefineModule(ModelSpec):
             self.point_anchor_weight * point_anchor +
             self.surface_anchor_weight * surface_anchor +
             self.surface_set_weight * surface_set +
+            self.edge_chamfer_loss_weight * edge_chamfer +
             self.normal_delta_weight * normal_delta +
             self.tangent_delta_weight * tangent_delta_loss +
             self.edge_point_anchor_weight * edge_point_anchor +
@@ -446,7 +611,12 @@ class CDRefineModule(ModelSpec):
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=None):
         with jt.no_grad():
             pc_stage1 = self._run_stage1(pcl_noisy, num_steps=num_steps)
-            pc_final, delta = self.refine(pc_stage1)
+            pc_edge_risk, pc_normal_proxy = self._estimate_runtime_geometry(pc_stage1)
+            pc_final, delta = self.refine(
+                pc_stage1,
+                pc_edge_risk=pc_edge_risk,
+                pc_normal_proxy=pc_normal_proxy,
+            )
         return pc_final, delta
 
     def training_step(self, batch: Dict) -> Dict:

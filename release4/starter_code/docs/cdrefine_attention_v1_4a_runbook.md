@@ -169,6 +169,40 @@ Score every checkpoint. If P2S collapses, reduce `delta_scale` to `0.06` or
 raise `surface_set_weight` to `0.70`. If CD barely moves, lower
 `surface_set_weight` to `0.25`.
 
+### Step 3: v1.4f Edge-Geometry Attention Fine-Tune
+
+This is the edge/angle/thin-structure version of the CD repair line. It keeps
+the v1.4a attention parameter shapes compatible, so it can continue from:
+
+```text
+/root/autodl-tmp/experiments/v1.4a_cdrefine_attn/checkpoint_3.pkl
+```
+
+The code changes are opt-in through config:
+
+- prediction estimates runtime edge risk from each stage1 patch, reducing the
+  train/predict mismatch where cache `pc_edge_risk` existed only during training
+- attention score gets a geometry gate from local normal proxies, so high-risk
+  points reduce cross-face neighbor mixing instead of smoothing sharp edges
+- `edge_delta_scale` gives high-risk points a larger residual budget while flat
+  regions keep a smaller `delta_scale`
+- `edge_chamfer_loss_weight` adds a risk-weighted set-CD term so edge/angle
+  points are not drowned out by large flat surfaces
+
+Run:
+
+```bash
+cd /root/src/starter_code
+
+python run.py --task configs/task/train_v1_4f_cdrefine_edge_geometry_tmp.yaml \
+  2>&1 | tee /root/autodl-tmp/train_v1.4f_cdrefine_edge_geometry.log
+```
+
+Score every checkpoint. If P2S drops too much, first lower
+`edge_delta_scale` to `0.06` or raise `surface_set_weight` to `0.60`. If CD does
+not move, raise `edge_chamfer_loss_weight` to `1.5` before increasing global
+`delta_scale`.
+
 ### Fallback: v1.4d Set-CD Soft-Surface Fine-Tune
 
 This is the preferred CD repair experiment after the official `CD_score=50.80`
