@@ -190,6 +190,7 @@ class DummySystem():
                         f'{self.ckpt_save_name}_step_{self.global_step}.pkl',
                     )
                     os.makedirs(self.ckpt_save_dir, exist_ok=True)
+                    _sync_jittor()
                     self.model.save(checkpoint_path)
                     _sync_jittor()
                 self.on_train_batch_end()

@@ -270,31 +270,48 @@ def patch_based_denoise(
         assert pcl_out.shape[0] == N, f"denoised point count mismatch: {pcl_out.shape[0]} != {N}"
         return pcl_out
 
+    if aggregation == "fast_best":
+        weights = jt.exp(-all_dists)
+        best_weights_idx, _ = jt.argmax(weights, dim=0)
+
+        pcl_out = pcl_noisy[0] * float(weight_floor)
+        hit_count = jt.ones((N, 1)) * float(weight_floor)
+        for i in range(num_patches):
+            idx = point_idxs[i]
+            chosen = (best_weights_idx[idx] == i)
+            chosen = chosen.float32().unsqueeze(1)
+            selected = patches_denoised[i] * chosen
+            pcl_out = pcl_out.scatter_(
+                0,
+                idx.unsqueeze(1).broadcast(selected.shape),
+                selected,
+                reduce='add',
+            )
+            hit_count = hit_count.scatter_(
+                0,
+                idx.unsqueeze(1),
+                chosen,
+                reduce='add',
+            )
+        pcl_out = pcl_out / (hit_count + 1e-12)
+        assert pcl_out.shape[0] == N, f"denoised point count mismatch: {pcl_out.shape[0]} != {N}"
+        return pcl_out
+
     if aggregation != "best":
         raise ValueError(f"unsupported patch aggregation: {aggregation}")
 
     weights = jt.exp(-all_dists)
     best_weights_idx, _ = jt.argmax(weights, dim=0)
-
-    pcl_out = pcl_noisy[0] * float(weight_floor)
-    hit_count = jt.ones((N, 1)) * float(weight_floor)
-    for i in range(num_patches):
-        idx = point_idxs[i]
-        chosen = (best_weights_idx[idx] == i)
-        chosen = chosen.float32().unsqueeze(1)
-        selected = patches_denoised[i] * chosen
-        pcl_out = pcl_out.scatter_(
-            0,
-            idx.unsqueeze(1).broadcast(selected.shape),
-            selected,
-            reduce='add',
-        )
-        hit_count = hit_count.scatter_(
-            0,
-            idx.unsqueeze(1),
-            chosen,
-            reduce='add',
-        )
-    pcl_out = pcl_out / (hit_count + 1e-12)
+    pcl_out = []
+    for pidx in range(N):
+        patch_id = best_weights_idx[pidx].item()
+        mask = (point_idxs[patch_id] == pidx)
+        if mask.sum().item() > 0:
+            pcl_out.append(patches_denoised[patch_id][mask][:1])
+        else:
+            # Rarely, FPS+KNN patches do not cover every point. Keep the original
+            # noisy point so inference always preserves the competition point count.
+            pcl_out.append(pcl_noisy[0, pidx:pidx+1])
+    pcl_out = jt.concat(pcl_out, dim=0)
     assert pcl_out.shape[0] == N, f"denoised point count mismatch: {pcl_out.shape[0]} != {N}"
     return pcl_out
