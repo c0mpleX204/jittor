@@ -1,0 +1,19 @@
+mode: train
+debug: False
+load_ckpt: /root/autodl-tmp/experiments/v1.4a_cdrefine_attn/checkpoint_3.pkl
+
+components:
+  data: train_refine_v1_3b_tmp
+  transform: cache_passthrough_tmp
+  system: v1_4b_cdrefine_attn_p2s_tmp
+  model: v1_4b_cdrefine_attn_p2s_tmp
+
+loss:
+  loss: 1.0
+
+optimizer:
+  __target__: adam
+  lr: 0.00002
+
+trainer:
+  epochs: 4

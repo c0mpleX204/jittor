@@ -1,5 +1,10 @@
 # Surface-Straight VM Experiment Summary
 
+Status: historical as of 2026-07-24. The current best submission candidate is
+`v1.4a RiskAwareCDRefine`; see
+`docs/cdrefine_attention_v1_4a_runbook.md`. Keep this document for the earlier
+single-VM and CVM progression details only.
+
 Date: 2026-07-19
 
 ## Repository State

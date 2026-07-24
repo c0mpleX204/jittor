@@ -1,0 +1,14 @@
+train_dataset:
+  shuffle: True
+  batch_size: 2
+  num_workers: 0
+  datapath:
+    input_dataset_dir: /root/autodl-tmp/cache_refine_v1.3b_dm_edge_mix6w
+    use_prob: False
+    loader: npz_patch
+    data_name: patch.npz
+    ignore_check: True
+    data_path:
+      cache: [
+        [/root/autodl-tmp/cache_refine_v1.3b_dm_edge_mix6w/train_cache.txt, 1.0],
+      ]

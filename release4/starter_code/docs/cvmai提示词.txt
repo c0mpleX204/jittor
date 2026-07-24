@@ -1,82 +1,66 @@
 给队友 AI 的提示词
 
-我们在做 Jittor 点云去噪正赛。请先读代码，不要凭记忆猜。
+我们在做 Jittor 点云去噪正赛。请先读代码和 docs，不要凭记忆猜。
 
 本地代码结构：release4/starter_code/...
 云端运行目录：/root/src/starter_code
 分支：exp/surface-straight-vm
 
 先读：
-docs/straightpcf_cvm_reproduction_tmp.md
+docs/cdrefine_attention_v1_4a_runbook.md
 docs/patch_cache_reminder.md
+src/model/cd_refine.py
 src/model/straightpcf_vm_dm.py
-src/model/dcvm.py
-src/model/vm.py
-src/model/feature.py
+src/model/parse.py
 
-当前主线不是单 VM，而是多 VM / CVM：
-模型：StraightPCFCoupledVelocityModule
-代码：src/model/straightpcf_vm_dm.py
+当前主线：
+noisy -> v1.3b DM -> v1.4a RiskAwareCDRefine
+
 当前最好权重：
-/root/autodl-tmp/experiments/straightpcf_cvm_cache12000_ep29_ft30_lr5e5/checkpoint_29.pkl
+/root/autodl-tmp/experiments/v1.4a_cdrefine_attn/checkpoint_3.pkl
 
-当前本地分数：
-CD 58.6531
-P2S 78.6321
-final 68.6426
+当前本地 full test 分数：
+CD 65.4856
+P2S 82.0600
+final 73.7728
 
-任务：
-新建一个多 VM 加分布约束的模型，不要破坏原模型。
+这是当前提交候选。不要覆盖 /root/autodl-tmp/result.zip，除非新 full test 明确超过 73.7728。
 
-建议文件：
-src/model/straightpcf_cvm_distribution.py
-
-建议类名：
-StraightPCFCoupledVelocityDistributionModule
-
-并在 src/model/parse.py 注册。
-
-核心目标：
-保留原 CVM loss，同时加入小权重分布约束，让输出既靠近 surface，也更像 clean patch 的覆盖分布。
-
-先做最小版 loss：
-loss = 原 CVM loss
-     + chamfer_weight * Chamfer(pc_pred, pc_clean)
-     + residual_weight * ||pc_pred - pc_current||^2
-
-先不要加强 density loss。过强的过密惩罚容易抹平边缘和薄结构。
-
-初始建议：
-num_dist_points: 256
-chamfer_weight: 0.2
-residual_weight: 0.01
-density_weight: 0.0
-lr: 2e-5
-batch_size: 2
-num_workers: 0
-
-训练从当前最好 CVM 继续，不要从头训：
-/root/autodl-tmp/experiments/straightpcf_cvm_cache12000_ep29_ft30_lr5e5/checkpoint_29.pkl
-
-训练用 patch cache：
-/root/autodl-tmp/cache_surface_straight_nf12000_seed123
+训练数据：
+/root/autodl-tmp/cache_refine_v1.3b_dm_edge_mix6w
 
 cache 里必须有：
-pc_noisy, pc_clean, pc_mix, pc_time
+pc_noisy, pc_mix, pc_clean, pc_clean_corr, pc_stage1, pc_edge_risk, pc_normal
 
-先训 5 或 10 epoch，然后测：
-Mean CD score
-Mean P2S score
-Mean final score
+官方提交暴露的新问题：
+CD_score 只有 50.80，P2S_score 是 80.08。现在不要再优先做 P2S 保护，
+要直接修 CD，目标是 CD_score 至少 70。
 
-判断：
-CD 涨且 P2S 基本不掉，可以继续。
-CD 涨但 P2S 小掉，也可以继续。
-P2S 大掉且 final 不涨，说明分布 loss 太强，要降权重或降 lr。
+下一步优先级：
+
+1. 先用 v1.4a checkpoint 做无训练 weighted patch inference：
+   configs/task/predict_noisy_test_v1_4a_cdrefine_attn_weighted_tmp.yaml
+2. 如果 weighted inference 提升 CD，继续扫 predict_patch_weight_temperature。
+3. 优先训练 v1.4e wide-CD surface-constrained fine-tune：
+   configs/task/train_v1_4e_cdrefine_attn_wide_surface_tmp.yaml
+4. full test 评分，和 v1.4a 的 73.7728、官方 CD_score 50.80 比。
+
+v1.4e 的核心改动：
+- 不要求每个点回到原始编号对应点
+- 主监督是集合 Chamfer/CD，让点云分布像 clean patch
+- point_anchor 和 pointwise surface_anchor 都关掉
+- delta_scale 提高到 0.08，给横向分布修复空间
+- 贴面是更强的 one-sided surface-set 软惩罚，防止离表面太远
+- 不加法向/切向移动硬限制
+- 加 light density matching
+- 推理使用 weighted patch aggregation
 
 不要做：
 1. 回到单 VM 当主线
-2. 从头训练
-3. 提交临时 YAML
-4. 只看 loss 不测分
-5. 一开始就上大 density loss
+2. 默认继续调 v1.3/v1.3b DM
+3. 只看 P2S 或 final，不看 CD
+4. 默认加入 pc_noisy - pc_stage1 条件；之前直接 noisy_delta 条件实验失败过，只能作为显式 ablation
+5. 用 half test 结果直接和 full100 结果比较
+
+提交检查：
+result.zip 顶层必须是 shapenet/，并包含 200 个 denoised.npy。

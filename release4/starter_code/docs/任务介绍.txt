@@ -1,43 +1,64 @@
 任务介绍
 
-现在我们的主线已经从单 VM 换成了多 VM / CVM。
+当前主线已经更新为：
 
-之前最好的单 VM 分数是 62.5085。现在多 VM 已经到：
+noisy -> v1.3b DM -> v1.4a RiskAwareCDRefine
 
-CD 58.6531
-P2S 78.6321
-final 68.6426
+旧的“只在多 VM / CVM 里加分布约束”是历史方向，不再是当前优先级。
+新对话请先读：
 
-当前最好权重是：
-/root/autodl-tmp/experiments/straightpcf_cvm_cache12000_ep29_ft30_lr5e5/checkpoint_29.pkl
+docs/cdrefine_attention_v1_4a_runbook.md
+src/model/cd_refine.py
+src/model/straightpcf_vm_dm.py
+src/model/parse.py
 
-我们现在的问题是：
-模型很会把点拉近表面，所以 P2S 很高；但 CD 还不够高，说明点云覆盖和局部分布还可以继续优化。
+当前本地 full test 最好结果：
 
-接下来不建议你继续在单 VM 后面做 CDRefine。更值得做的是：在多 VM 训练里直接加一点“分布约束”，让主干模型训练时就同时照顾 P2S 和 CD。
+v1.4a attention CDRefine ep4
+checkpoint:
+/root/autodl-tmp/experiments/v1.4a_cdrefine_attn/checkpoint_3.pkl
 
-你要做的事：
+score:
+CD 65.4856
+P2S 82.0600
+final 73.7728
 
-1. 基于当前多 VM 新建一个模型，不要改坏原来的 CVM。
-2. 保留原来的 CVM loss。
-3. 额外加小权重 Chamfer loss，让输出更像 clean patch。
-4. 加小权重 residual anchor，防止点移动太猛。
-5. 先不要加很强的过密惩罚，等 Chamfer 版有效后再说。
+这是当前提交候选，应先保留：
 
-训练方式：
+/root/autodl-tmp/result.zip
 
-从当前最好 CVM 继续训，不要从头训。
-先训 5 或 10 epoch。
-训练数据用已有 patch cache。
+当前有效链路：
 
-看结果时主要看：
+1. Stage1 使用 v1.3b DM：
+   /root/autodl-tmp/experiments/v1.3b_dm/checkpoint_0.pkl
+2. Refine cache：
+   /root/autodl-tmp/cache_refine_v1.3b_dm_edge_mix6w
+3. CDRefine 使用 RiskAwareCDRefineModule，内部有 local kNN risk-aware attention。
 
-CD 有没有涨
-P2S 有没有大掉
-final 有没有超过 68.6426
+官方提交暴露的新问题：
 
-如果 CD 涨、P2S 基本不掉，就继续。
-如果 P2S 掉很多，说明分布约束太强，需要降权重。
+CD_score 只有 50.80，P2S_score 是 80.08。现在不要再优先做 P2S 保护，
+要直接修 CD，目标是 CD_score 至少 70。
 
-简单说：
-不要等模型先把点云分布压坏，再靠第二阶段补 CD。现在要试的是让多 VM 主干本身就学会“贴表面但不破坏分布”。
+下一步优先级：
+
+1. 先用 v1.4a checkpoint 做无训练 weighted patch inference：
+   configs/task/predict_noisy_test_v1_4a_cdrefine_attn_weighted_tmp.yaml
+2. 如果 weighted inference 提升 CD，继续扫 predict_patch_weight_temperature。
+3. 优先训练 v1.4e wide-CD surface-constrained fine-tune：
+   configs/task/train_v1_4e_cdrefine_attn_wide_surface_tmp.yaml
+4. 只在新 full test 的 CD 明显上升且 final 超过 73.7728 后，才替换提交候选。
+5. pc_noisy - pc_stage1 可以以后作为显式 ablation 研究，但不要默认加入；之前直接 noisy_delta 条件实验失败过。
+
+v1.4e 的思想：
+
+- 不要求每个点回到原始编号对应点
+- 主监督是集合 Chamfer/CD，让点云分布像 clean patch
+- delta_scale 提高到 0.08，给横向分布修复空间
+- 贴面是更强的 one-sided surface-set 软惩罚，防止离表面太远
+- 不加法向/切向移动硬限制
+
+提交格式注意：
+
+result.zip 顶层必须只有 shapenet/，不要多包一层实验目录。
+datalist/test.txt 应有 200 个样本，zip 内也应有 200 个 denoised.npy。

@@ -192,7 +192,16 @@ def knn_points(x, y, k):
     nn = jt.stack(nn, dim=0)
     return dist_k, idx, nn
 
-def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_k=6, seed_k_alpha=1) -> jt.Var:
+def patch_based_denoise(
+    model: VelocityModule,
+    pcl_noisy,
+    patch_size=1000,
+    seed_k=6,
+    seed_k_alpha=1,
+    aggregation: str="best",
+    weight_temperature: float=1.0,
+    weight_floor: float=1e-12,
+) -> jt.Var:
     """
     pcl_noisy: (N, 3)
     """
@@ -219,8 +228,6 @@ def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_
     for i in range(num_patches):
         all_dists[i][point_idxs[i]] = patch_dists[i]
         
-    weights = jt.exp(-all_dists)
-    best_weights_idx, _ = jt.argmax(weights, dim=0)
     patches_denoised = []
     
     i = 0
@@ -238,6 +245,36 @@ def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_
     
     patches_denoised = jt.concat(patches_denoised, dim=0)
     patches_denoised = patches_denoised + seed_expand
+
+    if aggregation == "weighted":
+        temp = max(float(weight_temperature), 1e-6)
+        weighted_sum = pcl_noisy[0] * float(weight_floor)
+        weight_sum = jt.ones((N, 1)) * float(weight_floor)
+        for i in range(num_patches):
+            idx = point_idxs[i]
+            patch_weights = jt.exp(-patch_dists[i] / temp).unsqueeze(1)
+            weighted = patches_denoised[i] * patch_weights
+            weighted_sum = weighted_sum.scatter_(
+                0,
+                idx.unsqueeze(1).broadcast(weighted.shape),
+                weighted,
+                reduce='add',
+            )
+            weight_sum = weight_sum.scatter_(
+                0,
+                idx.unsqueeze(1),
+                patch_weights,
+                reduce='add',
+            )
+        pcl_out = weighted_sum / (weight_sum + 1e-12)
+        assert pcl_out.shape[0] == N, f"denoised point count mismatch: {pcl_out.shape[0]} != {N}"
+        return pcl_out
+
+    if aggregation != "best":
+        raise ValueError(f"unsupported patch aggregation: {aggregation}")
+
+    weights = jt.exp(-all_dists)
+    best_weights_idx, _ = jt.argmax(weights, dim=0)
     pcl_out = []
     for pidx in range(N):
         patch_id = best_weights_idx[pidx].item()

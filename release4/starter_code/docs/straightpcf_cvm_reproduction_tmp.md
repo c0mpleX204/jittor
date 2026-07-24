@@ -1,5 +1,10 @@
 # StraightPCF CVM Reproduction Temporary Report
 
+Status: historical as of 2026-07-24. The current best submission candidate is
+`v1.4a RiskAwareCDRefine`; see
+`docs/cdrefine_attention_v1_4a_runbook.md`. Keep this document for CVM
+reproduction details only.
+
 Date: 2026-07-21
 
 This is a temporary runbook for the official-style StraightPCF CVM experiment.

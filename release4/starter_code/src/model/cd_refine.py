@@ -86,6 +86,14 @@ def _chamfer_loss(pc_pred, pc_target, num_points: Optional[int]):
     return pred_to_target.mean() + target_to_pred.mean()
 
 
+def _one_sided_nn_loss(pc_pred, pc_target, num_points: Optional[int]):
+    pc_pred = _sample_points(pc_pred, num_points)
+    pc_target = _sample_points(pc_target, num_points)
+    dist = ((pc_pred.unsqueeze(2) - pc_target.unsqueeze(1)) ** 2.0).sum(dim=-1)
+    pred_to_target, _ = jt.topk(dist, k=1, dim=2, largest=False)
+    return pred_to_target.mean()
+
+
 def _density_matching_loss(pc_pred, pc_target, k: int, num_points: Optional[int]):
     if k <= 0:
         return 0.0
@@ -249,10 +257,14 @@ class CDRefineModule(ModelSpec):
         self.residual_anchor_weight = cfg.get("residual_anchor_weight", 0.02)
         self.point_anchor_weight = cfg.get("point_anchor_weight", 0.05)
         self.surface_anchor_weight = cfg.get("surface_anchor_weight", 0.05)
+        self.surface_set_weight = cfg.get("surface_set_weight", 0.0)
+        self.surface_set_num_points = cfg.get("surface_set_num_points", self.chamfer_num_points)
         self.normal_delta_weight = cfg.get("normal_delta_weight", 0.0)
+        self.tangent_delta_weight = cfg.get("tangent_delta_weight", 0.0)
         self.edge_point_anchor_weight = cfg.get("edge_point_anchor_weight", 0.0)
         self.edge_residual_anchor_weight = cfg.get("edge_residual_anchor_weight", 0.0)
         self.edge_normal_delta_weight = cfg.get("edge_normal_delta_weight", 0.0)
+        self.edge_tangent_delta_weight = cfg.get("edge_tangent_delta_weight", 0.0)
         self.density_loss_weight = cfg.get("density_loss_weight", 0.0)
         self.density_k = cfg.get("density_k", 8)
         self.density_num_points = cfg.get("density_num_points", self.chamfer_num_points)
@@ -263,6 +275,11 @@ class CDRefineModule(ModelSpec):
         self.normal_field = cfg.get("normal_field", "pc_normal")
         self.normal_source_field = cfg.get("normal_source_field", "pc_noisy")
         self.use_local_attention = cfg.get("use_local_attention", False)
+        self.predict_patch_size = cfg.get("predict_patch_size", 1000)
+        self.predict_patch_seed_k = cfg.get("predict_patch_seed_k", 6)
+        self.predict_patch_seed_k_alpha = cfg.get("predict_patch_seed_k_alpha", 1)
+        self.predict_patch_aggregation = cfg.get("predict_patch_aggregation", "best")
+        self.predict_patch_weight_temperature = cfg.get("predict_patch_weight_temperature", 1.0)
 
         self.encoder = FeatureExtraction(
             k=self.frame_knn,
@@ -334,14 +351,44 @@ class CDRefineModule(ModelSpec):
         residual_anchor = (delta ** 2.0).sum(dim=-1).mean()
         point_anchor = ((pc_final - pc_target) ** 2.0).sum(dim=-1).mean()
         surface_anchor = ((pc_final - pc_surface) ** 2.0).sum(dim=-1).mean()
-        normal_delta = 0.0
-        if pc_normal_proxy is not None and self.normal_delta_weight > 0:
+        surface_set = 0.0
+        if self.surface_set_weight > 0:
+            surface_set = _one_sided_nn_loss(
+                pc_pred=pc_final,
+                pc_target=pc_surface,
+                num_points=self.surface_set_num_points,
+            )
+
+        normal = None
+        normal_dot = None
+        tangent_delta_sq = None
+        needs_normal = (
+            pc_normal_proxy is not None and
+            (
+                self.normal_delta_weight > 0 or
+                self.tangent_delta_weight > 0 or
+                self.edge_normal_delta_weight > 0 or
+                self.edge_tangent_delta_weight > 0
+            )
+        )
+        if needs_normal:
             norm = jt.sqrt((pc_normal_proxy ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
             normal = pc_normal_proxy / norm
-            normal_delta = ((delta * normal).sum(dim=-1) ** 2.0).mean()
+            normal_dot = (delta * normal).sum(dim=-1, keepdims=True)
+            tangent_delta = delta - normal_dot * normal
+            tangent_delta_sq = (tangent_delta ** 2.0).sum(dim=-1)
+
+        normal_delta = 0.0
+        if normal_dot is not None and self.normal_delta_weight > 0:
+            normal_delta = (normal_dot.squeeze(-1) ** 2.0).mean()
+        tangent_delta_loss = 0.0
+        if tangent_delta_sq is not None and self.tangent_delta_weight > 0:
+            tangent_delta_loss = tangent_delta_sq.mean()
+
         edge_point_anchor = 0.0
         edge_residual_anchor = 0.0
         edge_normal_delta = 0.0
+        edge_tangent_delta = 0.0
         if pc_edge_risk is not None:
             edge_risk = pc_edge_risk.squeeze(-1)
             if self.edge_point_anchor_weight > 0:
@@ -351,14 +398,12 @@ class CDRefineModule(ModelSpec):
             if self.edge_residual_anchor_weight > 0:
                 edge_residual_anchor = (edge_risk * (delta ** 2.0).sum(dim=-1)).mean()
             if (
-                pc_normal_proxy is not None and
+                normal_dot is not None and
                 self.edge_normal_delta_weight > 0
             ):
-                norm = jt.sqrt((pc_normal_proxy ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
-                normal = pc_normal_proxy / norm
-                edge_normal_delta = (
-                    edge_risk * ((delta * normal).sum(dim=-1) ** 2.0)
-                ).mean()
+                edge_normal_delta = (edge_risk * (normal_dot.squeeze(-1) ** 2.0)).mean()
+            if tangent_delta_sq is not None and self.edge_tangent_delta_weight > 0:
+                edge_tangent_delta = (edge_risk * tangent_delta_sq).mean()
         density_loss = 0.0
         if self.density_loss_weight > 0:
             density_loss = _density_matching_loss(
@@ -372,10 +417,13 @@ class CDRefineModule(ModelSpec):
             self.residual_anchor_weight * residual_anchor +
             self.point_anchor_weight * point_anchor +
             self.surface_anchor_weight * surface_anchor +
+            self.surface_set_weight * surface_set +
             self.normal_delta_weight * normal_delta +
+            self.tangent_delta_weight * tangent_delta_loss +
             self.edge_point_anchor_weight * edge_point_anchor +
             self.edge_residual_anchor_weight * edge_residual_anchor +
             self.edge_normal_delta_weight * edge_normal_delta +
+            self.edge_tangent_delta_weight * edge_tangent_delta +
             self.density_loss_weight * density_loss
         ) / self.dsm_sigma
 
@@ -436,9 +484,11 @@ class CDRefineModule(ModelSpec):
             pc_next = patch_based_denoise(
                 model=self,  # type: ignore[arg-type]
                 pcl_noisy=pc_noisy,
-                patch_size=1000,
-                seed_k=6,
-                seed_k_alpha=1,
+                patch_size=self.predict_patch_size,
+                seed_k=self.predict_patch_seed_k,
+                seed_k_alpha=self.predict_patch_seed_k_alpha,
+                aggregation=self.predict_patch_aggregation,
+                weight_temperature=self.predict_patch_weight_temperature,
             )
             pc_denoised = pc_next.detach().numpy()
             res.append({"pc_denoised": pc_denoised})

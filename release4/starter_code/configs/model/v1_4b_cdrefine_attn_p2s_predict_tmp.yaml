@@ -1,0 +1,63 @@
+__target__: RiskAwareCDRefineModule
+frame_knn: 16
+feat_embedding_dim: 128
+decoder_hidden_dim: 64
+delta_scale: 0.015
+dsm_sigma: 0.01
+chamfer_num_points: 256
+chamfer_loss_weight: 0.8
+residual_anchor_weight: 0.04
+point_anchor_weight: 0.06
+surface_anchor_weight: 0.12
+normal_delta_weight: 0.02
+edge_point_anchor_weight: 0.0
+edge_residual_anchor_weight: 0.02
+edge_normal_delta_weight: 0.02
+density_loss_weight: 0.0
+density_k: 8
+target_field: pc_clean_corr
+fallback_target_field: pc_clean
+surface_field: pc_clean
+normal_field: pc_normal
+normal_source_field: pc_noisy
+use_local_attention: True
+attention_k: 16
+attention_hidden_dim: 64
+attention_residual_scale: 1.0
+attention_use_edge_risk: True
+stage1_ckpt: /root/autodl-tmp/experiments/v1.3b_dm/checkpoint_0.pkl
+stage1_model:
+  __target__: StraightPCFVelocityDistanceModule
+  num_modules: 2
+  tot_its: 4
+  dsm_sigma: 0.01
+  frame_knn: 16
+  feat_embedding_dim: 256
+  decoder_hidden_dim: 64
+  ratio_min: 0.0
+  ratio_max: 1.0
+  target_ratio_min: 0.0
+  target_ratio_max: 1.0
+  ratio_loss_weight: 1.0
+  finetune_loss_weight: 200.0
+  freeze_velocity: True
+  velocity_model:
+    frame_knn: 16
+    num_train_points: 128
+    feat_embedding_dim: 256
+    decoder_hidden_dim: 64
+    dsm_sigma: 0.01
+    denoise_steps: 4
+  coupled_model:
+    num_modules: 2
+    tot_its: 4
+    num_train_points: 128
+    dsm_sigma: 0.01
+    consistency_loss_weight: 10.0
+    velocity_model:
+      frame_knn: 16
+      num_train_points: 128
+      feat_embedding_dim: 256
+      decoder_hidden_dim: 64
+      dsm_sigma: 0.01
+      denoise_steps: 4
