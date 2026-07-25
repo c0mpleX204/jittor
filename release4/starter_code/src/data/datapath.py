@@ -62,6 +62,9 @@ class NpzPatchLazyAsset(LazyAsset):
             for optional_key in (
                 'pc_time',
                 'pc_stage1',
+                'pc_stage2',
+                'pc_dm_stage1',
+                'pc_ot_target',
                 'pc_cd',
                 'pc_clean_corr',
                 'pc_edge_risk',
