@@ -6,7 +6,7 @@ from .cd_refine import (
     TangentialCDRefineModule,
 )
 from .coupled_vm import CoupledSurfaceStraightVelocityModule
-from .dcvm import DirectionDistanceVelocityModule
+from .dcvm import DirectionDistanceVelocityModule, EdgeAwareDirectionDistanceVelocityModule
 from .distance_vm import StraightPCFDistanceVelocityModule
 from .edge_refine import EdgeRefineModule
 from .straightpcf_vm_dm import (
@@ -20,6 +20,7 @@ def get_model(model_config, **kwargs) -> ModelSpec:
         'CoupledSurfaceStraightVelocityModule': CoupledSurfaceStraightVelocityModule,
         'CDRefineModule': CDRefineModule,
         'DirectionDistanceVelocityModule': DirectionDistanceVelocityModule,
+        'EdgeAwareDirectionDistanceVelocityModule': EdgeAwareDirectionDistanceVelocityModule,
         'EdgeRefineModule': EdgeRefineModule,
         'EdgeAwareVelocityModule': EdgeAwareVelocityModule,
         'LocalAttentionCDRefineModule': LocalAttentionCDRefineModule,
