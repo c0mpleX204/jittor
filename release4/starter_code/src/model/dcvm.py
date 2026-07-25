@@ -160,52 +160,42 @@ class DirectionDistanceVelocityModule(ModelSpec):
 
 class EdgeAwareDirectionDistanceVelocityModule(DirectionDistanceVelocityModule):
     """
-    Surface-Straight VM with a gated edge/thin-structure branch.
+    Surface-Straight VM with an edge/thin-structure protection gate.
 
     This keeps DirectionDistanceVelocityModule's training target and inference
-    dynamics unchanged, then lets high edge-risk points borrow from a separate
-    velocity head instead of replacing the proven Surface-Straight formulation.
+    dynamics unchanged for ordinary surfaces. High edge-risk points are moved
+    less in stage 1, leaving the detailed correction to later refinement stages.
     """
 
     def __init__(self, model_config, transform_config):
         super().__init__(model_config, transform_config)
 
         cfg = self.model_config
-        self.edge_decoder = Decoder(
-            z_dim=self.encoder.embedding_dim,
-            dim=3,
-            out_dim=3,
-            hidden_size=cfg["decoder_hidden_dim"],
-        )
         self.gate_head = nn.Sequential(
             nn.Linear(self.encoder.embedding_dim, cfg["decoder_hidden_dim"]),
             nn.ReLU(),
             nn.Linear(cfg["decoder_hidden_dim"], 1),
         )
 
-        self.gate_bias = cfg.get("gate_bias", -2.5)
-        self.edge_loss_weight = cfg.get("edge_loss_weight", 0.25)
-        self.smooth_head_loss_weight = cfg.get("smooth_head_loss_weight", 0.05)
-        self.edge_head_loss_weight = cfg.get("edge_head_loss_weight", 0.20)
+        self.gate_bias = cfg.get("gate_bias", -4.0)
+        self.edge_protect_strength = cfg.get("edge_protect_strength", 0.25)
+        self.base_head_loss_weight = cfg.get("base_head_loss_weight", 0.10)
         self.gate_loss_weight = cfg.get("gate_loss_weight", 0.03)
         self.gate_sparsity_weight = cfg.get("gate_sparsity_weight", 0.01)
-        self.edge_risk_power = cfg.get("edge_risk_power", 1.0)
         self.gate_target_power = cfg.get("gate_target_power", 1.2)
 
     def _decode_velocity(self, feat, B, N, d):
         F_dim = feat.shape[-1]
         feat_flat = feat.reshape(-1, F_dim)
-        smooth_velocity = self.decoder(
-            c=feat_flat,
-        ).reshape(B, N, d)
-        edge_velocity = self.edge_decoder(
+        base_velocity = self.decoder(
             c=feat_flat,
         ).reshape(B, N, d)
         gate = jt.sigmoid(
             self.gate_head(feat_flat).reshape(B, N, 1) + float(self.gate_bias)
         )
-        pred_velocity = (1.0 - gate) * smooth_velocity + gate * edge_velocity
-        return pred_velocity, smooth_velocity, edge_velocity, gate
+        scale = 1.0 - float(self.edge_protect_strength) * gate
+        pred_velocity = scale * base_velocity
+        return pred_velocity, base_velocity, gate
 
     def _predict_velocity(self, pc_current):
         B, N, d = pc_current.shape
@@ -224,36 +214,32 @@ class EdgeAwareDirectionDistanceVelocityModule(DirectionDistanceVelocityModule):
             pc_edge_risk = pc_edge_risk[:, pnt_idx, :]
 
         target_velocity = pc_surface - pc_noisy_l2
-        pred_velocity, smooth_velocity, edge_velocity, gate = self._decode_velocity(
+        pred_velocity, base_velocity, gate = self._decode_velocity(
             feat=feat,
             B=B,
             N=len(pnt_idx),
             d=d,
         )
 
-        main_mse = ((pred_velocity - target_velocity) ** 2.0).sum(dim=-1)
-        loss = main_mse.mean() / self.dsm_sigma
-
         if pc_edge_risk is None:
+            main_mse = ((pred_velocity - target_velocity) ** 2.0).sum(dim=-1)
+            loss = main_mse.mean() / self.dsm_sigma
             return loss
 
         edge_risk = _clamp01(pc_edge_risk)
-        edge_weight = edge_risk
-        if self.edge_risk_power != 1.0:
-            edge_weight = edge_weight ** float(self.edge_risk_power)
         normal_weight = 1.0 - edge_risk
-
-        edge_mse = ((pred_velocity - target_velocity) ** 2.0).sum(dim=-1, keepdims=True)
-        smooth_mse = ((smooth_velocity - target_velocity) ** 2.0).sum(dim=-1, keepdims=True)
-        edge_head_mse = ((edge_velocity - target_velocity) ** 2.0).sum(dim=-1, keepdims=True)
-
-        edge_loss = _weighted_mean(edge_mse / self.dsm_sigma, edge_weight)
-        smooth_head_loss = _weighted_mean(smooth_mse / self.dsm_sigma, normal_weight)
-        edge_head_loss = _weighted_mean(edge_head_mse / self.dsm_sigma, edge_weight)
 
         gate_target = edge_risk
         if self.gate_target_power != 1.0:
             gate_target = gate_target ** float(self.gate_target_power)
+
+        target_scale = 1.0 - float(self.edge_protect_strength) * gate_target
+        protected_target_velocity = target_scale * target_velocity
+        main_mse = ((pred_velocity - protected_target_velocity) ** 2.0).sum(dim=-1)
+        loss = main_mse.mean() / self.dsm_sigma
+
+        base_mse = ((base_velocity - target_velocity) ** 2.0).sum(dim=-1, keepdims=True)
+        base_head_loss = _weighted_mean(base_mse / self.dsm_sigma, normal_weight)
         gate_loss = ((gate - gate_target) ** 2.0).mean()
         gate_sparsity = (normal_weight * (gate ** 2.0)).mean()
 
@@ -263,9 +249,7 @@ class EdgeAwareDirectionDistanceVelocityModule(DirectionDistanceVelocityModule):
 
         return (
             loss
-            + self.edge_loss_weight * edge_loss
-            + self.smooth_head_loss_weight * smooth_head_loss
-            + self.edge_head_loss_weight * edge_head_loss
+            + self.base_head_loss_weight * base_head_loss
             + self.gate_loss_weight * gate_loss
             + self.gate_sparsity_weight * gate_sparsity
             + (self.edge_velocity_anchor_weight * edge_anchor) / self.dsm_sigma
@@ -279,6 +263,6 @@ class EdgeAwareDirectionDistanceVelocityModule(DirectionDistanceVelocityModule):
         with jt.no_grad():
             pcl_next = pcl_noisy.clone()
             for _ in range(num_steps):
-                pred_velocity, _, _, _ = self._predict_velocity(pcl_next)
+                pred_velocity, _, _ = self._predict_velocity(pcl_next)
                 pcl_next = pcl_next + (1.0 / num_steps) * pred_velocity
         return pcl_next, None
