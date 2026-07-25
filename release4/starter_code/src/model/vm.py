@@ -3,7 +3,6 @@ from typing import Dict, List
 
 import jittor as jt
 import numpy as np
-from jittor import nn
 
 from .feature import FeatureExtraction, Decoder
 from .spec import ModelSpec
@@ -14,12 +13,6 @@ def get_random_indices(n, m):
     assert m < n
     idx = np.random.permutation(n)[:m]
     return jt.array(idx).int32()
-
-def _clamp01(x):
-    return jt.minimum(jt.maximum(x, jt.zeros_like(x)), jt.ones_like(x))
-
-def _weighted_mean(value, weight):
-    return (value * weight).sum() / (weight.sum() + 1e-6)
 
 class VelocityModule(ModelSpec):
     
@@ -146,168 +139,6 @@ class VelocityModule(ModelSpec):
             else:
                 d = {
                     "pc_noisy": b.sampled_vertices_noisy, # (N, 3)
-                }
-                if b.sampled_vertices is not None:
-                    d["pc_clean"] = b.sampled_vertices
-                res.append(d)
-        return res
-
-class EdgeAwareVelocityModule(VelocityModule):
-    """
-    VM with a gated edge/thin-structure branch.
-
-    The smooth branch keeps the original VM behavior. The edge branch receives
-    extra supervision on high-risk points, while the gate is weakly trained from
-    pc_edge_risk and initialized low so ordinary surfaces stay on the smooth path.
-    """
-
-    def __init__(self, model_config, transform_config):
-        super().__init__(model_config, transform_config)
-
-        cfg = self.model_config
-        self.denoise_steps = cfg.get('denoise_steps', 4)
-        self.target_field = cfg.get('target_field', 'pc_clean')
-        self.fallback_target_field = cfg.get('fallback_target_field', 'pc_clean')
-
-        self.edge_decoder = Decoder(
-            z_dim=self.encoder.embedding_dim,
-            dim=3,
-            out_dim=3,
-            hidden_size=cfg['decoder_hidden_dim'],
-        )
-        self.gate_head = nn.Sequential(
-            nn.Linear(self.encoder.embedding_dim, cfg['decoder_hidden_dim']),
-            nn.ReLU(),
-            nn.Linear(cfg['decoder_hidden_dim'], 1),
-        )
-
-        self.gate_bias = cfg.get('gate_bias', -2.0)
-        self.edge_loss_weight = cfg.get('edge_loss_weight', 0.5)
-        self.smooth_head_loss_weight = cfg.get('smooth_head_loss_weight', 0.15)
-        self.edge_head_loss_weight = cfg.get('edge_head_loss_weight', 0.3)
-        self.gate_loss_weight = cfg.get('gate_loss_weight', 0.02)
-        self.gate_sparsity_weight = cfg.get('gate_sparsity_weight', 0.02)
-        self.edge_risk_power = cfg.get('edge_risk_power', 1.0)
-        self.gate_target_power = cfg.get('gate_target_power', 1.0)
-
-    def _predict_dir(self, pc_mix):
-        B, N, d = pc_mix.shape
-        feat = self.encoder(pc_mix)
-        F_dim = feat.shape[2]
-        feat_flat = feat.reshape(-1, F_dim)
-
-        smooth_dir = self.decoder(
-            c=feat_flat,
-        ).reshape(B, N, d)
-        edge_dir = self.edge_decoder(
-            c=feat_flat,
-        ).reshape(B, N, d)
-        gate = jt.sigmoid(
-            self.gate_head(feat_flat).reshape(B, N, 1) + float(self.gate_bias)
-        )
-        pred_dir = (1.0 - gate) * smooth_dir + gate * edge_dir
-        return pred_dir, smooth_dir, edge_dir, gate
-
-    def get_supervised_loss(self, pc_noisy, pc_mix, pc_clean, pc_edge_risk=None):
-        B, N_noisy, d = pc_mix.shape
-        pnt_idx = get_random_indices(N_noisy, self.num_train_points)
-
-        pc_noisy = pc_noisy[:, pnt_idx, :]
-        pc_mix = pc_mix[:, pnt_idx, :]
-        pc_clean = pc_clean[:, pnt_idx, :]
-        if pc_edge_risk is not None:
-            pc_edge_risk = pc_edge_risk[:, pnt_idx, :]
-
-        target = pc_clean - pc_noisy
-        pred_dir, smooth_dir, edge_dir, gate = self._predict_dir(pc_mix)
-
-        main_mse = ((pred_dir - target) ** 2.0).sum(dim=-1)
-        loss = (main_mse / self.dsm_sigma).mean()
-
-        if pc_edge_risk is None:
-            return loss
-
-        edge_risk = _clamp01(pc_edge_risk)
-        if self.edge_risk_power != 1.0:
-            edge_weight = edge_risk ** float(self.edge_risk_power)
-        else:
-            edge_weight = edge_risk
-        normal_weight = 1.0 - edge_risk
-
-        edge_mse = ((pred_dir - target) ** 2.0).sum(dim=-1, keepdims=True)
-        smooth_mse = ((smooth_dir - target) ** 2.0).sum(dim=-1, keepdims=True)
-        edge_head_mse = ((edge_dir - target) ** 2.0).sum(dim=-1, keepdims=True)
-
-        edge_loss = _weighted_mean(edge_mse / self.dsm_sigma, edge_weight)
-        smooth_head_loss = _weighted_mean(smooth_mse / self.dsm_sigma, normal_weight)
-        edge_head_loss = _weighted_mean(edge_head_mse / self.dsm_sigma, edge_weight)
-
-        gate_target = edge_risk
-        if self.gate_target_power != 1.0:
-            gate_target = gate_target ** float(self.gate_target_power)
-        gate_loss = ((gate - gate_target) ** 2.0).mean()
-        gate_sparsity = (normal_weight * (gate ** 2.0)).mean()
-
-        return (
-            loss +
-            self.edge_loss_weight * edge_loss +
-            self.smooth_head_loss_weight * smooth_head_loss +
-            self.edge_head_loss_weight * edge_head_loss +
-            self.gate_loss_weight * gate_loss +
-            self.gate_sparsity_weight * gate_sparsity
-        )
-
-    def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=None):
-        B, N, d = pcl_noisy.shape
-        if num_steps is None:
-            num_steps = self.denoise_steps
-        with jt.no_grad():
-            pcl_next = pcl_noisy.clone()
-            for it in range(num_steps):
-                pred_dir, _, _, _ = self._predict_dir(pcl_next)
-                pcl_next = pcl_next + (1.0 / num_steps) * pred_dir
-        return pcl_next, None
-
-    def training_step(self, batch: Dict) -> Dict:
-        patch_size = batch['pc_noisy'].shape[-2]
-        pc_noisy = batch['pc_noisy'].reshape(-1, patch_size, 3)
-        pc_mix = batch['pc_mix'].reshape(-1, patch_size, 3)
-        pc_clean = batch['pc_clean'].reshape(-1, patch_size, 3)
-        pc_edge_risk = batch.get('pc_edge_risk', None)
-        if pc_edge_risk is not None:
-            pc_edge_risk = pc_edge_risk.reshape(-1, patch_size, 1)
-        loss = self.get_supervised_loss(
-            pc_noisy=pc_noisy,
-            pc_mix=pc_mix,
-            pc_clean=pc_clean,
-            pc_edge_risk=pc_edge_risk,
-        )
-        return {"loss": loss}
-
-    def process_fn(self, batch: List[Asset]) -> List[Dict]:
-        res = []
-        for b in batch:
-            if not self.is_predict():
-                assert b.meta is not None
-                target_key = self.target_field
-                if target_key not in b.meta:
-                    target_key = self.fallback_target_field
-                if target_key not in b.meta:
-                    raise KeyError(
-                        f"{b.path} does not contain {self.target_field} or "
-                        f"{self.fallback_target_field} for EdgeAwareVelocity supervision."
-                    )
-                d = {
-                    "pc_noisy": b.meta['pc_noisy'],
-                    "pc_clean": b.meta[target_key],
-                    "pc_mix": b.meta['pc_mix'],
-                }
-                if "pc_edge_risk" in b.meta:
-                    d["pc_edge_risk"] = b.meta["pc_edge_risk"]
-                res.append(d)
-            else:
-                d = {
-                    "pc_noisy": b.sampled_vertices_noisy,
                 }
                 if b.sampled_vertices is not None:
                     d["pc_clean"] = b.sampled_vertices
