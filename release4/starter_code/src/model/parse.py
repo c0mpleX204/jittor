@@ -13,7 +13,7 @@ from .straightpcf_vm_dm import (
     StraightPCFCoupledVelocityModule,
     StraightPCFVelocityDistanceModule,
 )
-from .vm import VelocityModule
+from .vm import EdgeAwareVelocityModule, VelocityModule
 
 def get_model(model_config, **kwargs) -> ModelSpec:
     MAP = {
@@ -21,6 +21,7 @@ def get_model(model_config, **kwargs) -> ModelSpec:
         'CDRefineModule': CDRefineModule,
         'DirectionDistanceVelocityModule': DirectionDistanceVelocityModule,
         'EdgeRefineModule': EdgeRefineModule,
+        'EdgeAwareVelocityModule': EdgeAwareVelocityModule,
         'LocalAttentionCDRefineModule': LocalAttentionCDRefineModule,
         'RiskAwareCDRefineModule': RiskAwareCDRefineModule,
         'StraightPCFCoupledVelocityModule': StraightPCFCoupledVelocityModule,
