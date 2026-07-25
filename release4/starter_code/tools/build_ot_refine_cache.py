@@ -194,18 +194,35 @@ def _sparse_match(pred: np.ndarray, target: np.ndarray, k: int, max_k: int) -> T
             cur_k = min(cur_k * 2, max_k)
 
 
-def ot_targets(stage2_batch: np.ndarray, target_batch: np.ndarray, k: int, max_k: int) -> Tuple[np.ndarray, Dict[str, int]]:
+def ot_targets(
+    stage2_batch: np.ndarray,
+    target_batch: np.ndarray,
+    k: int,
+    max_k: int,
+    method: str,
+) -> Tuple[np.ndarray, Dict[str, int]]:
     out = np.empty_like(stage2_batch, dtype=np.float32)
     stats = {"sparse": 0, "dense": 0, "greedy": 0, "max_k_used": 0}
     for i in range(stage2_batch.shape[0]):
-        matched, used_k, method = _sparse_match(
-            stage2_batch[i].astype(np.float64),
-            target_batch[i].astype(np.float64),
-            k=k,
-            max_k=max_k,
-        )
+        pred = stage2_batch[i].astype(np.float64)
+        target = target_batch[i].astype(np.float64)
+        if method == "greedy":
+            matched = _greedy_match(pred, target, k=min(k, len(pred)))
+            used_k = min(k, len(pred))
+            used_method = "greedy"
+        elif method == "dense":
+            matched = _dense_match(pred, target)
+            used_k = len(pred)
+            used_method = "dense"
+        else:
+            matched, used_k, used_method = _sparse_match(
+                pred,
+                target,
+                k=k,
+                max_k=max_k,
+            )
         out[i] = matched.astype(np.float32)
-        stats[method] += 1
+        stats[used_method] += 1
         stats["max_k_used"] = max(stats["max_k_used"], int(used_k))
     return out, stats
 
@@ -219,6 +236,7 @@ def flush_batch(args, model, batch_entries, patch_batch) -> Tuple[int, Dict[str,
         pc_target_batch.astype(np.float32),
         k=args.ot_knn,
         max_k=args.ot_max_knn,
+        method=args.match_method,
     )
 
     written = 0
@@ -250,6 +268,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--ot-knn", type=int, default=64)
     parser.add_argument("--ot-max-knn", type=int, default=256)
+    parser.add_argument(
+        "--match-method",
+        choices=("sparse", "greedy", "dense"),
+        default="sparse",
+        help="sparse is closer to OT but slower; greedy is a fast one-to-one approximation.",
+    )
     parser.add_argument("--log-every", type=int, default=500)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -313,6 +337,7 @@ def main() -> None:
         "batch_size": args.batch_size,
         "ot_knn": args.ot_knn,
         "ot_max_knn": args.ot_max_knn,
+        "match_method": args.match_method,
         "num_entries": len(entries),
         "num_patches": written,
         "matching": match_stats,
