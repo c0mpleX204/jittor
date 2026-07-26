@@ -271,8 +271,9 @@ def _partial_sinkhorn_ot_loss(
     # The dustbin lets unreliable long matches pay a fixed reject cost instead
     # of forcing every point into a one-to-one correspondence.
     B = pc_pred.shape[0]
-    cost = ((pc_pred.unsqueeze(2) - pc_target.unsqueeze(1)) ** 2.0).sum(dim=-1)
+    cost_raw = ((pc_pred.unsqueeze(2) - pc_target.unsqueeze(1)) ** 2.0).sum(dim=-1)
     reject_cost = float(radius) ** 2.0
+    cost = jt.minimum(cost_raw, jt.ones_like(cost_raw) * reject_cost)
     right = jt.ones((B, m, 1)) * reject_cost
     bottom = jt.ones((B, 1, m)) * reject_cost
     corner = jt.zeros((B, 1, 1))
