@@ -69,6 +69,8 @@ class NpzPatchLazyAsset(LazyAsset):
                 'pc_clean_corr',
                 'pc_edge_risk',
                 'pc_normal',
+                'pc_center',
+                'pc_surface_bank',
             ):
                 if optional_key in data:
                     meta[optional_key] = data[optional_key].astype(np.float64)

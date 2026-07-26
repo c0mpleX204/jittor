@@ -329,6 +329,25 @@ def _surface_guard_loss(
     return jt.maximum(excess, jt.zeros_like(excess)).mean()
 
 
+def _surface_bank_guard_loss(
+    pc_stage1,
+    pc_final,
+    pc_surface_bank,
+    num_points: Optional[int],
+    bank_num_points: Optional[int],
+    margin: float,
+):
+    idx = _random_indices(pc_final.shape[1], num_points)
+    if idx is not None:
+        pc_stage1 = pc_stage1[:, idx, :]
+        pc_final = pc_final[:, idx, :]
+    pc_surface_bank = _sample_points(pc_surface_bank, bank_num_points)
+    final_dist = _one_sided_nn_dist(pc_final, pc_surface_bank, None)
+    stage1_dist = _one_sided_nn_dist(pc_stage1, pc_surface_bank, None)
+    excess = final_dist - stage1_dist - float(margin)
+    return jt.maximum(excess, jt.zeros_like(excess)).mean()
+
+
 def _soft_local_transport_delta_loss(
     pc_stage1,
     delta,
@@ -579,10 +598,15 @@ class CDRefineModule(ModelSpec):
         self.surface_guard_weight = cfg.get("surface_guard_weight", 0.0)
         self.surface_guard_num_points = cfg.get("surface_guard_num_points", self.chamfer_num_points)
         self.surface_guard_margin = cfg.get("surface_guard_margin", 0.0)
+        self.surface_bank_guard_weight = cfg.get("surface_bank_guard_weight", 0.0)
+        self.surface_bank_guard_num_points = cfg.get("surface_bank_guard_num_points", self.chamfer_num_points)
+        self.surface_bank_guard_bank_points = cfg.get("surface_bank_guard_bank_points", 4096)
+        self.surface_bank_guard_margin = cfg.get("surface_bank_guard_margin", 0.0)
         self.allow_direct_refine = cfg.get("allow_direct_refine", False)
         self.target_field = cfg.get("target_field", "pc_clean_corr")
         self.fallback_target_field = cfg.get("fallback_target_field", "pc_clean")
         self.surface_field = cfg.get("surface_field", "pc_clean")
+        self.surface_bank_field = cfg.get("surface_bank_field", "pc_surface_bank")
         self.normal_field = cfg.get("normal_field", "pc_normal")
         self.normal_source_field = cfg.get("normal_source_field", "pc_noisy")
         self.use_local_attention = cfg.get("use_local_attention", False)
@@ -686,7 +710,15 @@ class CDRefineModule(ModelSpec):
         )
         return pc_stage1 + delta, delta
 
-    def get_supervised_loss(self, pc_stage1, pc_target, pc_surface=None, pc_normal_proxy=None, pc_edge_risk=None):
+    def get_supervised_loss(
+        self,
+        pc_stage1,
+        pc_target,
+        pc_surface=None,
+        pc_surface_bank=None,
+        pc_normal_proxy=None,
+        pc_edge_risk=None,
+    ):
         if pc_surface is None:
             pc_surface = pc_target
         pc_final, delta = self.refine(
@@ -814,6 +846,16 @@ class CDRefineModule(ModelSpec):
                 num_points=self.surface_guard_num_points,
                 margin=self.surface_guard_margin,
             )
+        surface_bank_guard = 0.0
+        if self.surface_bank_guard_weight > 0 and pc_surface_bank is not None:
+            surface_bank_guard = _surface_bank_guard_loss(
+                pc_stage1=pc_stage1,
+                pc_final=pc_final,
+                pc_surface_bank=pc_surface_bank,
+                num_points=self.surface_bank_guard_num_points,
+                bank_num_points=self.surface_bank_guard_bank_points,
+                margin=self.surface_bank_guard_margin,
+            )
         return (
             self.chamfer_loss_weight * chamfer +
             self.residual_anchor_weight * residual_anchor +
@@ -831,7 +873,8 @@ class CDRefineModule(ModelSpec):
             self.swd_loss_weight * swd_loss +
             self.local_ot_loss_weight * local_ot_loss +
             self.soft_ot_delta_weight * soft_ot_delta +
-            self.surface_guard_weight * surface_guard
+            self.surface_guard_weight * surface_guard +
+            self.surface_bank_guard_weight * surface_bank_guard
         ) / self.dsm_sigma
 
     def _run_stage1(self, pcl_noisy, num_steps: int=None):
@@ -868,6 +911,10 @@ class CDRefineModule(ModelSpec):
         pc_surface = batch.get("pc_surface", None)
         if pc_surface is not None:
             pc_surface = pc_surface.reshape(-1, patch_size, 3)
+        pc_surface_bank = batch.get("pc_surface_bank", None)
+        if pc_surface_bank is not None:
+            surface_bank_size = pc_surface_bank.shape[-2]
+            pc_surface_bank = pc_surface_bank.reshape(-1, surface_bank_size, 3)
         pc_normal_proxy = batch.get("pc_normal_proxy", None)
         if pc_normal_proxy is not None:
             pc_normal_proxy = pc_normal_proxy.reshape(-1, patch_size, 3)
@@ -878,6 +925,7 @@ class CDRefineModule(ModelSpec):
             pc_stage1=pc_stage1,
             pc_target=pc_target,
             pc_surface=pc_surface,
+            pc_surface_bank=pc_surface_bank,
             pc_normal_proxy=pc_normal_proxy,
             pc_edge_risk=pc_edge_risk,
         )
@@ -932,6 +980,8 @@ class CDRefineModule(ModelSpec):
                     d["pc_surface"] = b.meta[self.surface_field]
                 elif "pc_clean" in b.meta:
                     d["pc_surface"] = b.meta["pc_clean"]
+                if self.surface_bank_field in b.meta:
+                    d["pc_surface_bank"] = b.meta[self.surface_bank_field]
                 if self.normal_field in b.meta:
                     d["pc_normal_proxy"] = b.meta[self.normal_field]
                 elif (
@@ -941,7 +991,7 @@ class CDRefineModule(ModelSpec):
                     d["pc_normal_proxy"] = b.meta[self.normal_source_field] - d["pc_surface"]
                 if "pc_edge_risk" in b.meta:
                     d["pc_edge_risk"] = b.meta["pc_edge_risk"]
-                for optional_key in ("pc_noisy", "pc_mix", "pc_time"):
+                for optional_key in ("pc_noisy", "pc_mix", "pc_time", "pc_center"):
                     if optional_key in b.meta:
                         d[optional_key] = b.meta[optional_key]
                 res.append(d)

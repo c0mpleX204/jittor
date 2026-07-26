@@ -84,6 +84,78 @@ def _patch_pca_risk_and_normal(patches: np.ndarray, k: int) -> Tuple[np.ndarray,
         normals.append(patch_normal)
     return np.stack(risks, axis=0), np.stack(normals, axis=0)
 
+
+def _surface_complexity_scores(pc: np.ndarray, k: int) -> np.ndarray:
+    n = pc.shape[0]
+    if n <= 1:
+        return np.zeros((n,), dtype=np.float32)
+    kk = max(4, min(k, n))
+    dists, nn_idx = cKDTree(pc).query(pc, k=kk)
+    neigh = pc[nn_idx]
+    centered = neigh - neigh.mean(axis=1, keepdims=True)
+    cov = np.einsum("nki,nkj->nij", centered, centered) / max(kk - 1, 1)
+    eigvals, _ = np.linalg.eigh(cov)
+    eigvals = np.maximum(eigvals, 0.0)
+    total = eigvals.sum(axis=1) + 1e-12
+    curvatures = eigvals[:, 0] / total
+    linearities = (eigvals[:, 2] - eigvals[:, 1]) / (eigvals[:, 2] + 1e-12)
+    if np.ndim(dists) == 1:
+        radii = dists
+    else:
+        radii = (dists[:, 1:] ** 2.0).mean(axis=1)
+    return np.maximum.reduce(
+        [
+            _normalize01(curvatures),
+            _normalize01(linearities),
+            _normalize01(radii),
+        ]
+    ).astype(np.float32)
+
+
+def _sample_surface_bank(
+    pc: np.ndarray,
+    centers: np.ndarray,
+    bank_size: int,
+    complex_ratio: float,
+    complex_k: int,
+    complex_pool_ratio: float,
+) -> np.ndarray:
+    n = pc.shape[0]
+    if bank_size <= 0:
+        return np.zeros((centers.shape[0], 0, 3), dtype=np.float32)
+    complex_ratio = float(np.clip(complex_ratio, 0.0, 1.0))
+    complex_count = int(round(bank_size * complex_ratio))
+    uniform_count = bank_size - complex_count
+
+    complex_pool = None
+    if complex_count > 0:
+        scores = _surface_complexity_scores(pc, complex_k)
+        pool_size = max(complex_count, int(round(n * float(complex_pool_ratio))))
+        pool_size = min(max(pool_size, 1), n)
+        complex_pool = np.argsort(scores)[-pool_size:]
+
+    banks = []
+    for center in centers:
+        chunks = []
+        if uniform_count > 0:
+            chunks.append(
+                np.random.choice(n, size=uniform_count, replace=uniform_count > n)
+            )
+        if complex_count > 0 and complex_pool is not None:
+            chunks.append(
+                np.random.choice(
+                    complex_pool,
+                    size=complex_count,
+                    replace=complex_count > complex_pool.shape[0],
+                )
+            )
+        idx = np.concatenate(chunks) if chunks else np.empty((0,), dtype=np.int64)
+        if idx.shape[0] < bank_size:
+            pad = np.random.choice(n, size=bank_size - idx.shape[0], replace=True)
+            idx = np.concatenate([idx, pad])
+        banks.append(pc[idx[:bank_size]] - center[None, :])
+    return np.stack(banks, axis=0).astype(np.float32)
+
 @dataclass(frozen=True)
 class Augment(ConfigSpec):
     
@@ -392,6 +464,14 @@ class AugmentPatch(Augment):
     edge_seed_prob: float=0.0
 
     edge_seed_score_percentile: float=90.0
+
+    surface_bank_size: int=0
+
+    surface_bank_complex_ratio: float=0.0
+
+    surface_bank_complex_k: int=16
+
+    surface_bank_complex_pool_ratio: float=0.2
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentPatch':
@@ -474,6 +554,7 @@ class AugmentPatch(Augment):
                 pc_edge_risk = pc_edge_risk[select_idx]
                 pc_normal = pc_normal[select_idx]
                 t = t[select_idx]
+                seed_points_t = seed_points_t[select_idx]
         
         if asset.meta is None:
             asset.meta = {}
@@ -481,6 +562,16 @@ class AugmentPatch(Augment):
         asset.meta['pc_clean'] = pat_B
         asset.meta['pc_clean_corr'] = pat_clean_corr
         asset.meta['pc_mix'] = pat_t
+        asset.meta['pc_center'] = seed_points_t[:, 0, :]
+        if self.surface_bank_size > 0:
+            asset.meta['pc_surface_bank'] = _sample_surface_bank(
+                pc=pc,
+                centers=seed_points_t[:, 0, :],
+                bank_size=self.surface_bank_size,
+                complex_ratio=self.surface_bank_complex_ratio,
+                complex_k=self.surface_bank_complex_k,
+                complex_pool_ratio=self.surface_bank_complex_pool_ratio,
+            )
         if self.edge_risk:
             asset.meta['pc_edge_risk'] = pc_edge_risk
             asset.meta['pc_normal'] = pc_normal
