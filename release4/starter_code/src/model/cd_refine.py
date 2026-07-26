@@ -329,6 +329,58 @@ def _surface_guard_loss(
     return jt.maximum(excess, jt.zeros_like(excess)).mean()
 
 
+def _soft_local_transport_delta_loss(
+    pc_stage1,
+    delta,
+    pc_target,
+    num_points: Optional[int],
+    radius: float,
+    temperature: float,
+    max_delta: float,
+    coverage_beta: float,
+    confidence_power: float,
+):
+    if radius <= 0.0 or temperature <= 0.0 or max_delta <= 0.0:
+        return 0.0
+
+    src_idx = _random_indices(pc_stage1.shape[1], num_points)
+    if src_idx is not None:
+        pc_stage1 = pc_stage1[:, src_idx, :]
+        delta = delta[:, src_idx, :]
+    target_idx = _random_indices(pc_target.shape[1], num_points)
+    if target_idx is not None:
+        pc_target = pc_target[:, target_idx, :]
+
+    dist2 = ((pc_stage1.unsqueeze(2) - pc_target.unsqueeze(1)) ** 2.0).sum(dim=-1)
+    radius2 = float(radius) ** 2.0
+    local_mask = (dist2 <= radius2).float32()
+    local_kernel = jt.exp(-dist2 / float(temperature)) * local_mask
+
+    coverage = local_kernel.sum(dim=1, keepdims=True)
+    if coverage_beta != 0.0:
+        anti_crowd = (coverage + 1e-4) ** (-float(coverage_beta))
+        local_kernel = local_kernel * anti_crowd
+
+    denom = local_kernel.sum(dim=2, keepdims=True)
+    target_pos = (local_kernel.unsqueeze(-1) * pc_target.unsqueeze(1)).sum(dim=2) / (denom + 1e-8)
+    target_delta = target_pos - pc_stage1
+    target_norm = jt.sqrt((target_delta ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
+    cap = jt.minimum(
+        jt.ones_like(target_norm),
+        jt.ones_like(target_norm) * float(max_delta) / (target_norm + 1e-8),
+    )
+    target_delta = target_delta * cap
+
+    confidence = denom.squeeze(-1)
+    confidence = confidence / (confidence.mean(dim=1, keepdims=True) + 1e-8)
+    confidence = _clamp01(confidence)
+    if confidence_power != 1.0:
+        confidence = confidence ** float(confidence_power)
+
+    delta_error = ((delta - target_delta) ** 2.0).sum(dim=-1)
+    return (confidence * delta_error).sum() / (confidence.sum() + 1e-6)
+
+
 class LocalFeatureAttention(nn.Module):
     def __init__(
         self,
@@ -517,6 +569,13 @@ class CDRefineModule(ModelSpec):
         self.local_ot_temperature = cfg.get("local_ot_temperature", 0.0002)
         self.local_ot_iters = cfg.get("local_ot_iters", 12)
         self.local_ot_dustbin_mass = cfg.get("local_ot_dustbin_mass", 1.0)
+        self.soft_ot_delta_weight = cfg.get("soft_ot_delta_weight", 0.0)
+        self.soft_ot_num_points = cfg.get("soft_ot_num_points", self.chamfer_num_points)
+        self.soft_ot_radius = cfg.get("soft_ot_radius", 0.06)
+        self.soft_ot_temperature = cfg.get("soft_ot_temperature", 0.0005)
+        self.soft_ot_max_delta = cfg.get("soft_ot_max_delta", 0.04)
+        self.soft_ot_coverage_beta = cfg.get("soft_ot_coverage_beta", 0.75)
+        self.soft_ot_confidence_power = cfg.get("soft_ot_confidence_power", 1.0)
         self.surface_guard_weight = cfg.get("surface_guard_weight", 0.0)
         self.surface_guard_num_points = cfg.get("surface_guard_num_points", self.chamfer_num_points)
         self.surface_guard_margin = cfg.get("surface_guard_margin", 0.0)
@@ -733,6 +792,19 @@ class CDRefineModule(ModelSpec):
                 num_iters=self.local_ot_iters,
                 dustbin_mass=self.local_ot_dustbin_mass,
             )
+        soft_ot_delta = 0.0
+        if self.soft_ot_delta_weight > 0:
+            soft_ot_delta = _soft_local_transport_delta_loss(
+                pc_stage1=pc_stage1,
+                delta=delta,
+                pc_target=pc_target,
+                num_points=self.soft_ot_num_points,
+                radius=self.soft_ot_radius,
+                temperature=self.soft_ot_temperature,
+                max_delta=self.soft_ot_max_delta,
+                coverage_beta=self.soft_ot_coverage_beta,
+                confidence_power=self.soft_ot_confidence_power,
+            )
         surface_guard = 0.0
         if self.surface_guard_weight > 0:
             surface_guard = _surface_guard_loss(
@@ -758,6 +830,7 @@ class CDRefineModule(ModelSpec):
             self.density_loss_weight * density_loss +
             self.swd_loss_weight * swd_loss +
             self.local_ot_loss_weight * local_ot_loss +
+            self.soft_ot_delta_weight * soft_ot_delta +
             self.surface_guard_weight * surface_guard
         ) / self.dsm_sigma
 
