@@ -50,6 +50,8 @@ def default_cvm_dm_config() -> Dict:
         "target_ratio_max": 1.0,
         "ratio_loss_weight": 1.0,
         "finetune_loss_weight": 200.0,
+        "distance_feat_embedding_dim": 128,
+        "distance_decoder_hidden_dim": 128,
         "velocity_model": {
             "frame_knn": 16,
             "num_train_points": 128,
