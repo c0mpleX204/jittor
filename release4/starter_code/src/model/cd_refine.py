@@ -77,6 +77,13 @@ def _sample_points(pc, num_points: Optional[int]):
     return pc[:, idx, :]
 
 
+def _sample_points_pair(pc_a, pc_b, num_points: Optional[int]):
+    idx = _random_indices(pc_a.shape[1], num_points)
+    if idx is None:
+        return pc_a, pc_b
+    return pc_a[:, idx, :], pc_b[:, idx, :]
+
+
 def _sample_points_pair_with_extra(pc_a, pc_b, extra, num_points: Optional[int]):
     idx = _random_indices(pc_a.shape[1], num_points)
     if idx is None:
@@ -151,6 +158,14 @@ def _one_sided_nn_loss(pc_pred, pc_target, num_points: Optional[int]):
     return pred_to_target.mean()
 
 
+def _one_sided_nn_dist(pc_pred, pc_target, num_points: Optional[int]):
+    pc_pred = _sample_points(pc_pred, num_points)
+    pc_target = _sample_points(pc_target, num_points)
+    dist = ((pc_pred.unsqueeze(2) - pc_target.unsqueeze(1)) ** 2.0).sum(dim=-1)
+    pred_to_target, _ = jt.topk(dist, k=1, dim=2, largest=False)
+    return pred_to_target.squeeze(-1)
+
+
 def _weighted_chamfer_loss(
     pc_pred,
     pc_target,
@@ -203,6 +218,114 @@ def _density_matching_loss(pc_pred, pc_target, k: int, num_points: Optional[int]
     target_radius_sorted, _ = jt.topk(target_radius, k=target_radius.shape[1], dim=-1, largest=False)
     m = min(pred_radius_sorted.shape[1], target_radius_sorted.shape[1])
     return ((pred_radius_sorted[:, :m] - target_radius_sorted[:, :m]) ** 2.0).mean()
+
+
+def _sliced_wasserstein_loss(
+    pc_pred,
+    pc_target,
+    num_points: Optional[int],
+    num_projections: int,
+    power: float=2.0,
+):
+    if num_projections <= 0:
+        return 0.0
+    pc_pred = _sample_points(pc_pred, num_points)
+    pc_target = _sample_points(pc_target, num_points)
+    m = min(pc_pred.shape[1], pc_target.shape[1])
+    if m <= 1:
+        return 0.0
+    pc_pred = pc_pred[:, :m, :]
+    pc_target = pc_target[:, :m, :]
+
+    B = pc_pred.shape[0]
+    dirs = jt.randn((B, int(num_projections), 3))
+    dirs = _normalize_vectors(dirs)
+    pred_proj = (pc_pred.unsqueeze(2) * dirs.unsqueeze(1)).sum(dim=-1)
+    target_proj = (pc_target.unsqueeze(2) * dirs.unsqueeze(1)).sum(dim=-1)
+    pred_sorted, _ = jt.topk(pred_proj, k=m, dim=1, largest=False)
+    target_sorted, _ = jt.topk(target_proj, k=m, dim=1, largest=False)
+    diff = pred_sorted - target_sorted
+    if power == 1.0:
+        return jt.abs(diff).mean()
+    return (diff ** float(power)).mean()
+
+
+def _partial_sinkhorn_ot_loss(
+    pc_pred,
+    pc_target,
+    num_points: Optional[int],
+    radius: float,
+    temperature: float,
+    num_iters: int,
+    dustbin_mass: float,
+):
+    if num_iters <= 0 or radius <= 0.0 or temperature <= 0.0:
+        return 0.0
+    pc_pred, pc_target = _sample_points_pair(pc_pred, pc_target, num_points)
+    m = min(pc_pred.shape[1], pc_target.shape[1])
+    if m <= 1:
+        return 0.0
+    pc_pred = pc_pred[:, :m, :]
+    pc_target = pc_target[:, :m, :]
+
+    # The dustbin lets unreliable long matches pay a fixed reject cost instead
+    # of forcing every point into a one-to-one correspondence.
+    B = pc_pred.shape[0]
+    cost = ((pc_pred.unsqueeze(2) - pc_target.unsqueeze(1)) ** 2.0).sum(dim=-1)
+    reject_cost = float(radius) ** 2.0
+    right = jt.ones((B, m, 1)) * reject_cost
+    bottom = jt.ones((B, 1, m)) * reject_cost
+    corner = jt.zeros((B, 1, 1))
+    cost_top = jt.concat([cost, right], dim=2)
+    cost_bottom = jt.concat([bottom, corner], dim=2)
+    cost_aug = jt.concat([cost_top, cost_bottom], dim=1)
+
+    kernel = jt.exp(-cost_aug / float(temperature)) + 1e-8
+    total_mass = 1.0 + max(float(dustbin_mass), 1e-6)
+    real_mass = 1.0 / (float(m) * total_mass)
+    dust_mass = max(float(dustbin_mass), 1e-6) / total_mass
+    a = jt.concat(
+        [
+            jt.ones((B, m)) * real_mass,
+            jt.ones((B, 1)) * dust_mass,
+        ],
+        dim=1,
+    )
+    b = jt.concat(
+        [
+            jt.ones((B, m)) * real_mass,
+            jt.ones((B, 1)) * dust_mass,
+        ],
+        dim=1,
+    )
+    u = jt.ones((B, m + 1))
+    v = jt.ones((B, m + 1))
+    for _ in range(int(num_iters)):
+        kv = (kernel * v.unsqueeze(1)).sum(dim=2)
+        u = a / (kv + 1e-8)
+        ktu = (kernel * u.unsqueeze(2)).sum(dim=1)
+        v = b / (ktu + 1e-8)
+
+    plan = u.unsqueeze(2) * kernel * v.unsqueeze(1)
+    return (plan * cost_aug).sum() / float(B)
+
+
+def _surface_guard_loss(
+    pc_stage1,
+    pc_final,
+    pc_surface,
+    num_points: Optional[int],
+    margin: float,
+):
+    idx = _random_indices(pc_final.shape[1], num_points)
+    if idx is not None:
+        pc_stage1 = pc_stage1[:, idx, :]
+        pc_final = pc_final[:, idx, :]
+    pc_surface = _sample_points(pc_surface, num_points)
+    final_dist = _one_sided_nn_dist(pc_final, pc_surface, None)
+    stage1_dist = _one_sided_nn_dist(pc_stage1, pc_surface, None)
+    excess = final_dist - stage1_dist - float(margin)
+    return jt.maximum(excess, jt.zeros_like(excess)).mean()
 
 
 class LocalFeatureAttention(nn.Module):
@@ -383,6 +506,19 @@ class CDRefineModule(ModelSpec):
         self.density_loss_weight = cfg.get("density_loss_weight", 0.0)
         self.density_k = cfg.get("density_k", 8)
         self.density_num_points = cfg.get("density_num_points", self.chamfer_num_points)
+        self.swd_loss_weight = cfg.get("swd_loss_weight", 0.0)
+        self.swd_num_points = cfg.get("swd_num_points", self.chamfer_num_points)
+        self.swd_num_projections = cfg.get("swd_num_projections", 32)
+        self.swd_power = cfg.get("swd_power", 2.0)
+        self.local_ot_loss_weight = cfg.get("local_ot_loss_weight", 0.0)
+        self.local_ot_num_points = cfg.get("local_ot_num_points", self.chamfer_num_points)
+        self.local_ot_radius = cfg.get("local_ot_radius", 0.025)
+        self.local_ot_temperature = cfg.get("local_ot_temperature", 0.0002)
+        self.local_ot_iters = cfg.get("local_ot_iters", 12)
+        self.local_ot_dustbin_mass = cfg.get("local_ot_dustbin_mass", 1.0)
+        self.surface_guard_weight = cfg.get("surface_guard_weight", 0.0)
+        self.surface_guard_num_points = cfg.get("surface_guard_num_points", self.chamfer_num_points)
+        self.surface_guard_margin = cfg.get("surface_guard_margin", 0.0)
         self.allow_direct_refine = cfg.get("allow_direct_refine", False)
         self.target_field = cfg.get("target_field", "pc_clean_corr")
         self.fallback_target_field = cfg.get("fallback_target_field", "pc_clean")
@@ -576,6 +712,35 @@ class CDRefineModule(ModelSpec):
                 k=self.density_k,
                 num_points=self.density_num_points,
             )
+        swd_loss = 0.0
+        if self.swd_loss_weight > 0:
+            swd_loss = _sliced_wasserstein_loss(
+                pc_pred=pc_final,
+                pc_target=pc_target,
+                num_points=self.swd_num_points,
+                num_projections=self.swd_num_projections,
+                power=self.swd_power,
+            )
+        local_ot_loss = 0.0
+        if self.local_ot_loss_weight > 0:
+            local_ot_loss = _partial_sinkhorn_ot_loss(
+                pc_pred=pc_final,
+                pc_target=pc_target,
+                num_points=self.local_ot_num_points,
+                radius=self.local_ot_radius,
+                temperature=self.local_ot_temperature,
+                num_iters=self.local_ot_iters,
+                dustbin_mass=self.local_ot_dustbin_mass,
+            )
+        surface_guard = 0.0
+        if self.surface_guard_weight > 0:
+            surface_guard = _surface_guard_loss(
+                pc_stage1=pc_stage1,
+                pc_final=pc_final,
+                pc_surface=pc_surface,
+                num_points=self.surface_guard_num_points,
+                margin=self.surface_guard_margin,
+            )
         return (
             self.chamfer_loss_weight * chamfer +
             self.residual_anchor_weight * residual_anchor +
@@ -589,7 +754,10 @@ class CDRefineModule(ModelSpec):
             self.edge_residual_anchor_weight * edge_residual_anchor +
             self.edge_normal_delta_weight * edge_normal_delta +
             self.edge_tangent_delta_weight * edge_tangent_delta +
-            self.density_loss_weight * density_loss
+            self.density_loss_weight * density_loss +
+            self.swd_loss_weight * swd_loss +
+            self.local_ot_loss_weight * local_ot_loss +
+            self.surface_guard_weight * surface_guard
         ) / self.dsm_sigma
 
     def _run_stage1(self, pcl_noisy, num_steps: int=None):
