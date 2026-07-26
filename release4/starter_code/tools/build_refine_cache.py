@@ -31,7 +31,7 @@ from src.model.parse import get_model  # noqa: E402
 
 DEFAULT_CHECKPOINT = (
     "/root/autodl-tmp/experiments/"
-    "straightpcf_vm_dm_from_cvm_ep59_cache12000_b2_lr5e5_10ep/checkpoint_9.pkl"
+    "v1.3b_dm/checkpoint_0.pkl"
 )
 
 
@@ -50,8 +50,6 @@ def default_cvm_dm_config() -> Dict:
         "target_ratio_max": 1.0,
         "ratio_loss_weight": 1.0,
         "finetune_loss_weight": 200.0,
-        "distance_feat_embedding_dim": 128,
-        "distance_decoder_hidden_dim": 128,
         "velocity_model": {
             "frame_knn": 16,
             "num_train_points": 128,
