@@ -80,6 +80,19 @@ def read_cache_list(path: Path) -> List[str]:
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def resolve_patch_path(source_cache: Path, entry: str, data_name: str) -> Path:
+    entry_path = Path(entry)
+    if entry_path.is_absolute():
+        return entry_path / data_name
+    return source_cache / entry_path / data_name
+
+
+def output_entry(entry: str, idx: int, sequential_output: bool) -> str:
+    if sequential_output or Path(entry).is_absolute():
+        return (Path("patches") / f"{idx:08d}").as_posix()
+    return Path(entry).as_posix()
+
+
 def load_yaml(path: Path) -> Dict:
     return OmegaConf.to_container(OmegaConf.load(path), resolve=True)  # type: ignore[return-value]
 
@@ -140,18 +153,18 @@ def predict_stage1(model, pc_noisy_batch: np.ndarray) -> np.ndarray:
     return pc_stage1.detach().numpy().astype(np.float32)
 
 
-def flush_batch(args, model, rel_batch: List[str], patch_batch: List[Dict[str, np.ndarray]]) -> int:
+def flush_batch(args, model, out_batch: List[str], patch_batch: List[Dict[str, np.ndarray]]) -> int:
     pc_noisy_batch = np.concatenate([item[args.input_field] for item in patch_batch], axis=0)
     pc_stage1_batch = predict_stage1(model, pc_noisy_batch)
     sync_jittor()
 
     written = 0
     offset = 0
-    for rel_dir, patch in zip(rel_batch, patch_batch):
+    for rel_dir, patch in zip(out_batch, patch_batch):
         count = int(patch[args.input_field].shape[0])
         payload = dict(patch)
         payload[args.stage1_field] = pc_stage1_batch[offset:offset + count].astype(np.float32)
-        save_patch(args.out_dir / rel_dir / args.data_name, payload)
+        save_patch(args.out_dir / Path(rel_dir) / args.data_name, payload)
         offset += count
         written += count
     return written
@@ -171,6 +184,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=500)
+    parser.add_argument(
+        "--sequential-output",
+        action="store_true",
+        help="Write output patches as patches/00000000... instead of preserving source list entries.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -185,31 +203,33 @@ def main() -> None:
         rel_paths = rel_paths[:args.limit]
     if not rel_paths:
         raise ValueError(f"No cache entries found in {list_path}")
+    sequential_output = args.sequential_output or any(Path(entry).is_absolute() for entry in rel_paths)
 
     clear_out_dir(args.out_dir, args.overwrite)
     model = load_model(args)
 
     out_lines = []
-    rel_batch: List[str] = []
+    out_batch: List[str] = []
     patch_batch: List[Dict[str, np.ndarray]] = []
     written = 0
-    for idx, rel_dir in enumerate(rel_paths):
-        patch = load_patch(args.source_cache / rel_dir / args.data_name)
+    for idx, source_entry in enumerate(rel_paths):
+        patch = load_patch(resolve_patch_path(args.source_cache, source_entry, args.data_name))
         if args.input_field not in patch:
-            raise KeyError(f"{rel_dir}/{args.data_name} missing {args.input_field}")
-        rel_batch.append(rel_dir)
+            raise KeyError(f"{source_entry}/{args.data_name} missing {args.input_field}")
+        out_dir = output_entry(source_entry, idx, sequential_output)
+        out_batch.append(out_dir)
         patch_batch.append(patch)
-        out_lines.append(rel_dir)
+        out_lines.append(out_dir)
 
         if len(patch_batch) >= args.batch_size:
-            written += flush_batch(args, model, rel_batch, patch_batch)
-            rel_batch = []
+            written += flush_batch(args, model, out_batch, patch_batch)
+            out_batch = []
             patch_batch = []
             if written % args.log_every == 0:
                 print(f"wrote {written}/{len(rel_paths)} stage1 patches", flush=True)
 
     if patch_batch:
-        written += flush_batch(args, model, rel_batch, patch_batch)
+        written += flush_batch(args, model, out_batch, patch_batch)
 
     (args.out_dir / args.list_name).write_text("\n".join(out_lines) + "\n", encoding="utf-8")
     metadata = {
@@ -222,6 +242,8 @@ def main() -> None:
         "input_field": args.input_field,
         "stage1_field": args.stage1_field,
         "batch_size": args.batch_size,
+        "source_entries_are_absolute": any(Path(entry).is_absolute() for entry in rel_paths),
+        "sequential_output": sequential_output,
         "num_entries": len(rel_paths),
         "num_patches": written,
     }
