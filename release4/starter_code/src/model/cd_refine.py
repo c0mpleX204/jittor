@@ -1963,7 +1963,7 @@ class ScoreFieldRefineModule(TangentSpreadRefineModule):
         self.hole_loss_weight = cfg.get("hole_loss_weight", 0.04)
         self.normal_delta_weight = cfg.get("normal_delta_weight", 0.25)
         self.anchor_loss_weight = cfg.get("anchor_loss_weight", 0.02)
-        self.surface_bank_guard_weight = cfg.get("surface_bank_guard_weight", 0.35)
+        self.surface_bank_guard_weight = cfg.get("surface_bank_guard_weight", 0.0)
         self.surface_bank_guard_margin = cfg.get("surface_bank_guard_margin", 0.00004)
 
         self.score_extra_dim = 10
