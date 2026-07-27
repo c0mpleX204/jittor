@@ -364,17 +364,45 @@ def _self_knn_distances(pc, k: int):
     return jt.sqrt(knn2[:, :, 1:] + 1e-12)
 
 
-def _tangent_spread_target(pc, normal, k: int, max_step: float, dense_power: float):
+def _local_spacing(pc, k: int):
     neighbors = _knn_neighbors(pc, k)
     if neighbors is None:
-        return jt.zeros_like(pc), jt.zeros((pc.shape[0], pc.shape[1])), jt.ones((pc.shape[0], 1)) * 1e-3
+        return None, None, None
 
     rel = pc.unsqueeze(2) - neighbors
     dist = jt.sqrt((rel ** 2.0).sum(dim=-1) + 1e-12)
+    return dist.mean(dim=2), dist, neighbors
+
+
+def _tangent_spread_target(
+    pc,
+    normal,
+    k: int,
+    max_step: float,
+    dense_power: float,
+    pc_reference=None,
+    reference_spacing_scale: float=1.0,
+):
+    local_spacing, dist, neighbors = _local_spacing(pc, k)
+    if local_spacing is None:
+        return (
+            jt.zeros_like(pc),
+            jt.zeros((pc.shape[0], pc.shape[1])),
+            jt.ones((pc.shape[0], pc.shape[1])) * 1e-3,
+        )
+
+    if pc_reference is not None:
+        reference_spacing, _, _ = _local_spacing(pc_reference, k)
+        if reference_spacing is None:
+            target_spacing = local_spacing.mean(dim=1, keepdims=True).broadcast(local_spacing.shape)
+        else:
+            target_spacing = reference_spacing * float(reference_spacing_scale)
+    else:
+        target_spacing = local_spacing.mean(dim=1, keepdims=True).broadcast(local_spacing.shape)
+
     local_spacing = dist.mean(dim=2)
-    patch_spacing = local_spacing.mean(dim=1, keepdims=True)
     dense = jt.maximum(
-        (patch_spacing - local_spacing) / (patch_spacing + 1e-8),
+        (target_spacing - local_spacing) / (target_spacing + 1e-8),
         jt.zeros_like(local_spacing),
     )
     if dense_power != 1.0:
@@ -386,7 +414,7 @@ def _tangent_spread_target(pc, normal, k: int, max_step: float, dense_power: flo
     force = (weight.unsqueeze(-1) * direction).sum(dim=2)
     force_tan, _ = _project_to_tangent(force, normal)
     target_delta = _normalize_vectors(force_tan) * (float(max_step) * dense).unsqueeze(-1)
-    return target_delta, dense, patch_spacing
+    return target_delta, dense, target_spacing
 
 
 def _weighted_mean(value, weight):
@@ -1056,8 +1084,10 @@ class TangentSpreadRefineModule(ModelSpec):
     Distribution-only refine stage.
 
     It does not use clean points as correspondence targets. The stage learns a
-    small tangent residual that spreads locally crowded stage-1 points while a
-    surface-bank hinge prevents moving farther away from the surface proxy.
+    small tangent residual that spreads locally crowded stage-1 points. When a
+    noisy reference is available, only points that became more crowded than the
+    original noisy distribution are encouraged to move. A surface-bank hinge
+    prevents moving farther away from the surface proxy.
     """
 
     def __init__(self, model_config, transform_config):
@@ -1072,11 +1102,21 @@ class TangentSpreadRefineModule(ModelSpec):
         self.loss_num_points = cfg.get("loss_num_points", 512)
         self.normal_k = cfg.get("normal_k", self.frame_knn)
         self.spread_k = cfg.get("spread_k", 16)
+        self.mid_spread_k = cfg.get("mid_spread_k", 0)
         self.repulsion_k = cfg.get("repulsion_k", 8)
         self.force_delta_scale = cfg.get("force_delta_scale", self.delta_scale)
         self.dense_power = cfg.get("dense_power", 1.0)
+        self.reference_field = cfg.get("reference_field", "pc_noisy")
+        self.reference_spacing_scale = cfg.get("reference_spacing_scale", 1.0)
+        self.use_density_delta_gate = cfg.get("use_density_delta_gate", True)
+        self.density_gate_floor = cfg.get("density_gate_floor", 0.0)
+        self.density_gate_power = cfg.get("density_gate_power", 1.0)
+        self.mid_force_weight = cfg.get("mid_force_weight", 0.0)
+        self.mid_delta_boost = cfg.get("mid_delta_boost", 0.0)
         self.repulsion_radius_scale = cfg.get("repulsion_radius_scale", 0.72)
         self.spacing_target_scale = cfg.get("spacing_target_scale", 1.0)
+        self.reference_overexpand_weight = cfg.get("reference_overexpand_weight", 0.0)
+        self.reference_upper_scale = cfg.get("reference_upper_scale", 1.25)
         self.force_loss_weight = cfg.get("force_loss_weight", 0.5)
         self.repulsion_loss_weight = cfg.get("repulsion_loss_weight", 1.0)
         self.spacing_loss_weight = cfg.get("spacing_loss_weight", 0.25)
@@ -1148,7 +1188,45 @@ class TangentSpreadRefineModule(ModelSpec):
         raw_delta = self.decoder(c=feat.reshape(-1, F_dim)).reshape(B, N, d)
         return float(self.delta_scale) * jt.tanh(raw_delta)
 
-    def refine(self, pc_stage1, pc_normal_proxy=None):
+    def _density_gate(self, pc_stage1, normal, pc_reference=None):
+        if not self.use_density_delta_gate or pc_reference is None:
+            return None
+
+        _, dense_weight, _ = _tangent_spread_target(
+            pc_stage1,
+            normal,
+            k=self.spread_k,
+            max_step=1.0,
+            dense_power=self.dense_power,
+            pc_reference=pc_reference,
+            reference_spacing_scale=self.reference_spacing_scale,
+        )
+        if self.mid_spread_k and self.mid_spread_k > 0 and self.mid_force_weight > 0:
+            _, mid_dense, _ = _tangent_spread_target(
+                pc_stage1,
+                normal,
+                k=self.mid_spread_k,
+                max_step=1.0,
+                dense_power=self.dense_power,
+                pc_reference=pc_reference,
+                reference_spacing_scale=self.reference_spacing_scale,
+            )
+            dense_weight = jt.maximum(
+                dense_weight,
+                mid_dense * float(self.mid_force_weight),
+            )
+
+        gate = _clamp01(dense_weight)
+        if self.density_gate_power != 1.0:
+            gate = gate ** float(self.density_gate_power)
+        if self.density_gate_floor > 0.0:
+            gate = (
+                float(self.density_gate_floor) +
+                (1.0 - float(self.density_gate_floor)) * gate
+            )
+        return gate.unsqueeze(-1)
+
+    def refine(self, pc_stage1, pc_normal_proxy=None, pc_reference=None):
         normal = self._normal_proxy(pc_stage1, pc_normal_proxy=pc_normal_proxy)
         raw_delta = self._predict_delta(pc_stage1)
         if self.project_delta_to_tangent:
@@ -1156,12 +1234,27 @@ class TangentSpreadRefineModule(ModelSpec):
         else:
             delta = raw_delta
             normal_dot = (raw_delta * normal).sum(dim=-1, keepdims=True)
+        density_gate = self._density_gate(
+            pc_stage1,
+            normal,
+            pc_reference=pc_reference,
+        )
+        if density_gate is not None:
+            delta = delta * density_gate
+            normal_dot = normal_dot * density_gate
         return pc_stage1 + delta, delta, raw_delta, normal, normal_dot
 
-    def get_distribution_loss(self, pc_stage1, pc_surface_bank=None, pc_normal_proxy=None):
+    def get_distribution_loss(
+        self,
+        pc_stage1,
+        pc_surface_bank=None,
+        pc_normal_proxy=None,
+        pc_reference=None,
+    ):
         pc_final, delta, raw_delta, normal, normal_dot = self.refine(
             pc_stage1,
             pc_normal_proxy=pc_normal_proxy,
+            pc_reference=pc_reference,
         )
 
         idx = _random_indices(pc_stage1.shape[1], self.loss_num_points)
@@ -1171,20 +1264,49 @@ class TangentSpreadRefineModule(ModelSpec):
             delta_l = delta[:, idx, :]
             normal_l = normal[:, idx, :]
             normal_dot_l = normal_dot[:, idx, :]
+            pc_reference_l = pc_reference[:, idx, :] if pc_reference is not None else None
         else:
             pc_stage1_l = pc_stage1
             pc_final_l = pc_final
             delta_l = delta
             normal_l = normal
             normal_dot_l = normal_dot
+            pc_reference_l = pc_reference
 
-        target_delta, dense_weight, patch_spacing = _tangent_spread_target(
+        target_delta, dense_weight, target_spacing = _tangent_spread_target(
             pc_stage1_l,
             normal_l,
             k=self.spread_k,
             max_step=self.force_delta_scale,
             dense_power=self.dense_power,
+            pc_reference=pc_reference_l,
+            reference_spacing_scale=self.reference_spacing_scale,
         )
+        if self.mid_spread_k and self.mid_spread_k > 0 and self.mid_force_weight > 0:
+            mid_delta, mid_dense, _ = _tangent_spread_target(
+                pc_stage1_l,
+                normal_l,
+                k=self.mid_spread_k,
+                max_step=self.force_delta_scale,
+                dense_power=self.dense_power,
+                pc_reference=pc_reference_l,
+                reference_spacing_scale=self.reference_spacing_scale,
+            )
+            dense_weight = jt.maximum(
+                dense_weight,
+                mid_dense * float(self.mid_force_weight),
+            )
+            target_delta = target_delta + mid_delta * float(self.mid_force_weight)
+            if self.mid_delta_boost > 0.0:
+                delta_cap = (
+                    float(self.force_delta_scale) *
+                    (1.0 + float(self.mid_delta_boost) * _clamp01(mid_dense))
+                ).unsqueeze(-1)
+                target_norm = jt.sqrt((target_delta ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
+                target_delta = target_delta * jt.minimum(
+                    jt.ones_like(target_norm),
+                    delta_cap / (target_norm + 1e-8),
+                )
         force_loss = _weighted_mean(
             ((delta_l - target_delta) ** 2.0).sum(dim=-1),
             dense_weight,
@@ -1195,19 +1317,38 @@ class TangentSpreadRefineModule(ModelSpec):
         final_knn = _self_knn_distances(pc_final_l, self.repulsion_k)
         if final_knn is not None:
             min_radius = (
-                patch_spacing.reshape(patch_spacing.shape[0], 1, 1) *
+                target_spacing.unsqueeze(-1) *
                 float(self.repulsion_radius_scale)
             )
             close = jt.maximum(min_radius - final_knn, jt.zeros_like(final_knn))
             repulsion_loss = (close ** 2.0).mean()
 
             final_spacing = final_knn.mean(dim=2)
-            target_spacing = patch_spacing * float(self.spacing_target_scale)
+            target_spacing = target_spacing * float(self.spacing_target_scale)
             spacing_shortfall = jt.maximum(
                 target_spacing - final_spacing,
                 jt.zeros_like(final_spacing),
             )
             spacing_loss = _weighted_mean(spacing_shortfall ** 2.0, dense_weight)
+
+        reference_overexpand = 0.0
+        if (
+            self.reference_overexpand_weight > 0 and
+            pc_reference_l is not None and
+            final_knn is not None
+        ):
+            reference_spacing, _, _ = _local_spacing(pc_reference_l, self.repulsion_k)
+            if reference_spacing is not None:
+                final_spacing = final_knn.mean(dim=2)
+                upper_spacing = reference_spacing * float(self.reference_upper_scale)
+                over = jt.maximum(
+                    final_spacing - upper_spacing,
+                    jt.zeros_like(final_spacing),
+                )
+                reference_overexpand = _weighted_mean(
+                    over ** 2.0,
+                    jt.ones_like(dense_weight),
+                )
 
         normal_delta = (normal_dot_l.squeeze(-1) ** 2.0).mean()
         anchor = (delta_l ** 2.0).sum(dim=-1).mean()
@@ -1227,6 +1368,7 @@ class TangentSpreadRefineModule(ModelSpec):
             self.force_loss_weight * force_loss +
             self.repulsion_loss_weight * repulsion_loss +
             self.spacing_loss_weight * spacing_loss +
+            self.reference_overexpand_weight * reference_overexpand +
             self.normal_delta_weight * normal_delta +
             self.anchor_loss_weight * anchor +
             self.surface_bank_guard_weight * surface_bank_guard
@@ -1252,12 +1394,18 @@ class TangentSpreadRefineModule(ModelSpec):
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=None):
         with jt.no_grad():
             pc_stage1 = self._run_stage1(pcl_noisy, num_steps=num_steps)
-            pc_final, delta, _, _, _ = self.refine(pc_stage1)
+            pc_final, delta, _, _, _ = self.refine(
+                pc_stage1,
+                pc_reference=pcl_noisy,
+            )
         return pc_final, delta
 
     def training_step(self, batch: Dict) -> Dict:
         patch_size = batch["pc_stage1"].shape[-2]
         pc_stage1 = batch["pc_stage1"].reshape(-1, patch_size, 3)
+        pc_reference = batch.get("pc_reference", None)
+        if pc_reference is not None:
+            pc_reference = pc_reference.reshape(-1, patch_size, 3)
         pc_surface_bank = batch.get("pc_surface_bank", None)
         if pc_surface_bank is not None:
             surface_bank_size = pc_surface_bank.shape[-2]
@@ -1269,6 +1417,7 @@ class TangentSpreadRefineModule(ModelSpec):
             pc_stage1=pc_stage1,
             pc_surface_bank=pc_surface_bank,
             pc_normal_proxy=pc_normal_proxy,
+            pc_reference=pc_reference,
         )
         return {"loss": loss}
 
@@ -1306,6 +1455,8 @@ class TangentSpreadRefineModule(ModelSpec):
                         "Build a refine cache with tools/build_refine_cache.py first."
                     )
                 d = {"pc_stage1": b.meta["pc_stage1"]}
+                if self.reference_field in b.meta:
+                    d["pc_reference"] = b.meta[self.reference_field]
                 if self.surface_bank_field in b.meta:
                     d["pc_surface_bank"] = b.meta[self.surface_bank_field]
                 if self.normal_field in b.meta:
