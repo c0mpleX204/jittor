@@ -1505,6 +1505,14 @@ class NoisyGuidedAlphaRefineModule(TangentSpreadRefineModule):
         self.alpha_bn_2 = nn.BatchNorm1d(hidden)
         self.alpha_lin_3 = nn.Linear(hidden, 1)
         self.alpha_act = nn.ReLU()
+        self._freeze_unused_delta_decoder()
+
+    def _freeze_unused_delta_decoder(self):
+        for param in self.decoder.parameters():
+            if hasattr(param, "stop_grad"):
+                param.stop_grad()
+            if hasattr(param, "requires_grad"):
+                param.requires_grad = False
 
     def _guide_one_scale(self, pc_stage1, normal, pc_reference, k: int, max_step: float):
         local_spacing, dist, neighbors = _local_spacing(pc_stage1, k)
@@ -1524,11 +1532,12 @@ class NoisyGuidedAlphaRefineModule(TangentSpreadRefineModule):
             }
 
         if pc_reference is not None:
-            reference_spacing, _, _ = _local_spacing(pc_reference, k)
-            residual = pc_reference - pc_stage1
+            residual_tan, _ = _project_to_tangent(pc_reference - pc_stage1, normal)
+            pc_reference_tangent = pc_stage1 + residual_tan
+            reference_spacing, _, _ = _local_spacing(pc_reference_tangent, k)
         else:
             reference_spacing = local_spacing.mean(dim=1, keepdims=True).broadcast(local_spacing.shape)
-            residual = jt.zeros_like(pc_stage1)
+            residual_tan = jt.zeros_like(pc_stage1)
         if reference_spacing is None:
             reference_spacing = local_spacing.mean(dim=1, keepdims=True).broadcast(local_spacing.shape)
 
@@ -1556,7 +1565,6 @@ class NoisyGuidedAlphaRefineModule(TangentSpreadRefineModule):
         force_tan, _ = _project_to_tangent(force, normal)
         force_unit = _normalize_vectors(force_tan)
 
-        residual_tan, _ = _project_to_tangent(residual, normal)
         residual_norm = jt.sqrt((residual_tan ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
         residual_unit = residual_tan / (residual_norm + 1e-8)
         residual_step = jt.minimum(
@@ -1803,6 +1811,88 @@ class NoisyGuidedAlphaRefineModule(TangentSpreadRefineModule):
                 pc_reference=pcl_noisy,
             )
         return pc_final, delta
+
+
+class DirectionCorrectedNoisyGuidedRefineModule(NoisyGuidedAlphaRefineModule):
+    """
+    Noisy-guided refine with a learnable tangent direction correction.
+
+    The base guide still comes from noisy/stage-1 density changes, but the
+    network can add a small tangent correction instead of only accepting or
+    rejecting the guide with alpha.
+    """
+
+    def __init__(self, model_config, transform_config):
+        super().__init__(model_config, transform_config)
+        cfg = self.model_config
+        self.correction_scale = cfg.get("correction_scale", 0.006)
+        self.correction_action_floor = cfg.get("correction_action_floor", 0.0)
+        self.correction_action_power = cfg.get("correction_action_power", 1.0)
+
+        alpha_in_dim = self.encoder.embedding_dim + self.alpha_feature_dim
+        hidden = self.decoder_hidden_dim
+        self.corr_lin_1 = nn.Linear(alpha_in_dim, hidden)
+        self.corr_bn_1 = nn.BatchNorm1d(hidden)
+        self.corr_lin_2 = nn.Linear(hidden, hidden)
+        self.corr_bn_2 = nn.BatchNorm1d(hidden)
+        self.corr_lin_3 = nn.Linear(hidden, 3)
+        self.corr_act = nn.ReLU()
+
+    def _predict_alpha_and_correction(self, pc_stage1, guide_feature):
+        B, N, _ = pc_stage1.shape
+        feat = self.encoder(pc_stage1)
+        net_in = jt.concat([feat, guide_feature], dim=-1).reshape(B * N, -1)
+
+        alpha_net = self.alpha_lin_1(net_in)
+        alpha_net = self.alpha_bn_1(alpha_net)
+        alpha_net = self.alpha_act(alpha_net)
+        alpha_net = self.alpha_lin_2(alpha_net)
+        alpha_net = self.alpha_bn_2(alpha_net)
+        alpha_net = self.alpha_act(alpha_net)
+        alpha = jt.sigmoid(self.alpha_lin_3(alpha_net)).reshape(B, N, 1)
+        alpha = alpha * float(self.alpha_max)
+
+        corr_net = self.corr_lin_1(net_in)
+        corr_net = self.corr_bn_1(corr_net)
+        corr_net = self.corr_act(corr_net)
+        corr_net = self.corr_lin_2(corr_net)
+        corr_net = self.corr_bn_2(corr_net)
+        corr_net = self.corr_act(corr_net)
+        correction_unit = jt.tanh(self.corr_lin_3(corr_net)).reshape(B, N, 3)
+        return alpha, correction_unit
+
+    def refine(self, pc_stage1, pc_normal_proxy=None, pc_reference=None):
+        normal = self._normal_proxy(pc_stage1, pc_normal_proxy=pc_normal_proxy)
+        guide = self._build_guide(
+            pc_stage1,
+            normal,
+            pc_reference=pc_reference,
+        )
+        alpha, correction_unit = self._predict_alpha_and_correction(
+            pc_stage1,
+            guide["feature"],
+        )
+        action = _clamp01(jt.maximum(guide["dense"], guide["sparse"]))
+        if self.correction_action_power != 1.0:
+            action = action ** float(self.correction_action_power)
+        if self.correction_action_floor > 0.0:
+            action = (
+                float(self.correction_action_floor) +
+                (jt.ones_like(action) - float(self.correction_action_floor)) * action
+            )
+
+        correction = (
+            float(self.correction_scale) *
+            action.unsqueeze(-1) *
+            correction_unit
+        )
+        correction, _ = _project_to_tangent(correction, normal)
+        delta = alpha * guide["guide"] + correction
+        if self.project_delta_to_tangent:
+            delta, normal_dot = _project_to_tangent(delta, normal)
+        else:
+            normal_dot = (delta * normal).sum(dim=-1, keepdims=True)
+        return pc_stage1 + delta, delta, guide, normal, normal_dot, alpha
 
 
 class TangentialCDRefineModule(CDRefineModule):
