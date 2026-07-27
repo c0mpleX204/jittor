@@ -348,6 +348,52 @@ def _surface_bank_guard_loss(
     return jt.maximum(excess, jt.zeros_like(excess)).mean()
 
 
+def _project_to_tangent(vec, normal):
+    normal = _normalize_vectors(normal)
+    normal_dot = (vec * normal).sum(dim=-1, keepdims=True)
+    return vec - normal_dot * normal, normal_dot
+
+
+def _self_knn_distances(pc, k: int):
+    B, N, _ = pc.shape
+    k = min(int(k) + 1, N)
+    if k <= 1:
+        return None
+    dist2 = ((pc.unsqueeze(2) - pc.unsqueeze(1)) ** 2.0).sum(dim=-1)
+    knn2, _ = jt.topk(dist2, k=k, dim=-1, largest=False)
+    return jt.sqrt(knn2[:, :, 1:] + 1e-12)
+
+
+def _tangent_spread_target(pc, normal, k: int, max_step: float, dense_power: float):
+    neighbors = _knn_neighbors(pc, k)
+    if neighbors is None:
+        return jt.zeros_like(pc), jt.zeros((pc.shape[0], pc.shape[1])), jt.ones((pc.shape[0], 1)) * 1e-3
+
+    rel = pc.unsqueeze(2) - neighbors
+    dist = jt.sqrt((rel ** 2.0).sum(dim=-1) + 1e-12)
+    local_spacing = dist.mean(dim=2)
+    patch_spacing = local_spacing.mean(dim=1, keepdims=True)
+    dense = jt.maximum(
+        (patch_spacing - local_spacing) / (patch_spacing + 1e-8),
+        jt.zeros_like(local_spacing),
+    )
+    if dense_power != 1.0:
+        dense = dense ** float(dense_power)
+
+    bandwidth = dist[:, :, -1:] + 1e-6
+    weight = jt.exp(-((dist / bandwidth) ** 2.0))
+    direction = rel / (dist.unsqueeze(-1) + 1e-8)
+    force = (weight.unsqueeze(-1) * direction).sum(dim=2)
+    force_tan, _ = _project_to_tangent(force, normal)
+    target_delta = _normalize_vectors(force_tan) * (float(max_step) * dense).unsqueeze(-1)
+    return target_delta, dense, patch_spacing
+
+
+def _weighted_mean(value, weight):
+    denom = weight.sum() + 1e-6
+    return (value * weight).sum() / denom
+
+
 def _soft_local_transport_delta_loss(
     pc_stage1,
     delta,
@@ -999,6 +1045,274 @@ class CDRefineModule(ModelSpec):
                 d = {
                     "pc_noisy": b.sampled_vertices_noisy,
                 }
+                if b.sampled_vertices is not None:
+                    d["pc_clean"] = b.sampled_vertices
+                res.append(d)
+        return res
+
+
+class TangentSpreadRefineModule(ModelSpec):
+    """
+    Distribution-only refine stage.
+
+    It does not use clean points as correspondence targets. The stage learns a
+    small tangent residual that spreads locally crowded stage-1 points while a
+    surface-bank hinge prevents moving farther away from the surface proxy.
+    """
+
+    def __init__(self, model_config, transform_config):
+        super().__init__(model_config, transform_config)
+
+        cfg = self.model_config
+        self.frame_knn = cfg.get("frame_knn", 32)
+        self.feat_embedding_dim = cfg.get("feat_embedding_dim", 128)
+        self.decoder_hidden_dim = cfg.get("decoder_hidden_dim", 64)
+        self.delta_scale = cfg.get("delta_scale", 0.012)
+        self.dsm_sigma = cfg.get("dsm_sigma", 0.01)
+        self.loss_num_points = cfg.get("loss_num_points", 512)
+        self.normal_k = cfg.get("normal_k", self.frame_knn)
+        self.spread_k = cfg.get("spread_k", 16)
+        self.repulsion_k = cfg.get("repulsion_k", 8)
+        self.force_delta_scale = cfg.get("force_delta_scale", self.delta_scale)
+        self.dense_power = cfg.get("dense_power", 1.0)
+        self.repulsion_radius_scale = cfg.get("repulsion_radius_scale", 0.72)
+        self.spacing_target_scale = cfg.get("spacing_target_scale", 1.0)
+        self.force_loss_weight = cfg.get("force_loss_weight", 0.5)
+        self.repulsion_loss_weight = cfg.get("repulsion_loss_weight", 1.0)
+        self.spacing_loss_weight = cfg.get("spacing_loss_weight", 0.25)
+        self.normal_delta_weight = cfg.get("normal_delta_weight", 0.5)
+        self.anchor_loss_weight = cfg.get("anchor_loss_weight", 0.04)
+        self.surface_bank_guard_weight = cfg.get("surface_bank_guard_weight", 0.2)
+        self.surface_bank_guard_num_points = cfg.get("surface_bank_guard_num_points", self.loss_num_points)
+        self.surface_bank_guard_bank_points = cfg.get("surface_bank_guard_bank_points", 2048)
+        self.surface_bank_guard_margin = cfg.get("surface_bank_guard_margin", 0.0005)
+        self.project_delta_to_tangent = cfg.get("project_delta_to_tangent", True)
+        self.allow_direct_refine = cfg.get("allow_direct_refine", False)
+        self.normal_field = cfg.get("normal_field", "pc_normal")
+        self.surface_bank_field = cfg.get("surface_bank_field", "pc_surface_bank")
+        self.predict_patch_size = cfg.get("predict_patch_size", 1000)
+        self.predict_patch_seed_k = cfg.get("predict_patch_seed_k", 6)
+        self.predict_patch_seed_k_alpha = cfg.get("predict_patch_seed_k_alpha", 1)
+        self.predict_patch_aggregation = cfg.get("predict_patch_aggregation", "best")
+        self.predict_patch_weight_temperature = cfg.get("predict_patch_weight_temperature", 1.0)
+
+        self.encoder = FeatureExtraction(
+            k=self.frame_knn,
+            input_dim=3,
+            embedding_dim=self.feat_embedding_dim,
+            distance_estimation=cfg.get("normalize_features", True),
+        )
+        self.decoder = Decoder(
+            z_dim=self.encoder.embedding_dim,
+            dim=3,
+            out_dim=3,
+            hidden_size=self.decoder_hidden_dim,
+        )
+
+        self.stage1_ckpt = cfg.get("stage1_ckpt", cfg.get("cvm_dm_ckpt", None))
+        self.stage1_model = None
+        if self.stage1_ckpt is not None:
+            stage1_cfg = cfg.get("stage1_model", None)
+            if stage1_cfg is None:
+                stage1_cfg = _default_stage1_config()
+            self.stage1_model = StraightPCFVelocityDistanceModule(
+                model_config=_without_target(stage1_cfg),
+                transform_config=transform_config,
+            )
+            self.stage1_model.load(self.stage1_ckpt)
+            self._freeze_stage1_model()
+
+    def _freeze_stage1_model(self):
+        self.stage1_model.eval()
+        for param in self.stage1_model.parameters():
+            if hasattr(param, "stop_grad"):
+                param.stop_grad()
+            if hasattr(param, "requires_grad"):
+                param.requires_grad = False
+
+    def _normal_proxy(self, pc_stage1, pc_normal_proxy=None):
+        if pc_normal_proxy is not None:
+            return _normalize_vectors(pc_normal_proxy)
+        neighbors = _knn_neighbors(pc_stage1, self.normal_k)
+        if neighbors is None:
+            return jt.zeros_like(pc_stage1)
+        normal = _cross_normal_from_neighbors(pc_stage1, neighbors)
+        if normal is None:
+            return jt.zeros_like(pc_stage1)
+        return _normalize_vectors(normal)
+
+    def _predict_delta(self, pc_stage1):
+        B, N, d = pc_stage1.shape
+        feat = self.encoder(pc_stage1)
+        F_dim = feat.shape[-1]
+        raw_delta = self.decoder(c=feat.reshape(-1, F_dim)).reshape(B, N, d)
+        return float(self.delta_scale) * jt.tanh(raw_delta)
+
+    def refine(self, pc_stage1, pc_normal_proxy=None):
+        normal = self._normal_proxy(pc_stage1, pc_normal_proxy=pc_normal_proxy)
+        raw_delta = self._predict_delta(pc_stage1)
+        if self.project_delta_to_tangent:
+            delta, normal_dot = _project_to_tangent(raw_delta, normal)
+        else:
+            delta = raw_delta
+            normal_dot = (raw_delta * normal).sum(dim=-1, keepdims=True)
+        return pc_stage1 + delta, delta, raw_delta, normal, normal_dot
+
+    def get_distribution_loss(self, pc_stage1, pc_surface_bank=None, pc_normal_proxy=None):
+        pc_final, delta, raw_delta, normal, normal_dot = self.refine(
+            pc_stage1,
+            pc_normal_proxy=pc_normal_proxy,
+        )
+
+        idx = _random_indices(pc_stage1.shape[1], self.loss_num_points)
+        if idx is not None:
+            pc_stage1_l = pc_stage1[:, idx, :]
+            pc_final_l = pc_final[:, idx, :]
+            delta_l = delta[:, idx, :]
+            normal_l = normal[:, idx, :]
+            normal_dot_l = normal_dot[:, idx, :]
+        else:
+            pc_stage1_l = pc_stage1
+            pc_final_l = pc_final
+            delta_l = delta
+            normal_l = normal
+            normal_dot_l = normal_dot
+
+        target_delta, dense_weight, patch_spacing = _tangent_spread_target(
+            pc_stage1_l,
+            normal_l,
+            k=self.spread_k,
+            max_step=self.force_delta_scale,
+            dense_power=self.dense_power,
+        )
+        force_loss = _weighted_mean(
+            ((delta_l - target_delta) ** 2.0).sum(dim=-1),
+            dense_weight,
+        )
+
+        repulsion_loss = 0.0
+        spacing_loss = 0.0
+        final_knn = _self_knn_distances(pc_final_l, self.repulsion_k)
+        if final_knn is not None:
+            min_radius = (
+                patch_spacing.reshape(patch_spacing.shape[0], 1, 1) *
+                float(self.repulsion_radius_scale)
+            )
+            close = jt.maximum(min_radius - final_knn, jt.zeros_like(final_knn))
+            repulsion_loss = (close ** 2.0).mean()
+
+            final_spacing = final_knn.mean(dim=2)
+            target_spacing = patch_spacing * float(self.spacing_target_scale)
+            spacing_shortfall = jt.maximum(
+                target_spacing - final_spacing,
+                jt.zeros_like(final_spacing),
+            )
+            spacing_loss = _weighted_mean(spacing_shortfall ** 2.0, dense_weight)
+
+        normal_delta = (normal_dot_l.squeeze(-1) ** 2.0).mean()
+        anchor = (delta_l ** 2.0).sum(dim=-1).mean()
+
+        surface_bank_guard = 0.0
+        if self.surface_bank_guard_weight > 0 and pc_surface_bank is not None:
+            surface_bank_guard = _surface_bank_guard_loss(
+                pc_stage1=pc_stage1,
+                pc_final=pc_final,
+                pc_surface_bank=pc_surface_bank,
+                num_points=self.surface_bank_guard_num_points,
+                bank_num_points=self.surface_bank_guard_bank_points,
+                margin=self.surface_bank_guard_margin,
+            )
+
+        loss = (
+            self.force_loss_weight * force_loss +
+            self.repulsion_loss_weight * repulsion_loss +
+            self.spacing_loss_weight * spacing_loss +
+            self.normal_delta_weight * normal_delta +
+            self.anchor_loss_weight * anchor +
+            self.surface_bank_guard_weight * surface_bank_guard
+        ) / self.dsm_sigma
+        return loss
+
+    def _run_stage1(self, pcl_noisy, num_steps: int=None):
+        if self.stage1_model is None:
+            if self.allow_direct_refine:
+                return pcl_noisy
+            raise RuntimeError(
+                "TangentSpreadRefineModule prediction requires stage1_ckpt/stage1_model. "
+                "Set allow_direct_refine=True only for direct-refine ablations."
+            )
+        self.stage1_model.eval()
+        with jt.no_grad():
+            pc_stage1, _ = self.stage1_model.denoise_langevin_dynamics(
+                pcl_noisy,
+                num_steps=num_steps,
+            )
+        return pc_stage1
+
+    def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=None):
+        with jt.no_grad():
+            pc_stage1 = self._run_stage1(pcl_noisy, num_steps=num_steps)
+            pc_final, delta, _, _, _ = self.refine(pc_stage1)
+        return pc_final, delta
+
+    def training_step(self, batch: Dict) -> Dict:
+        patch_size = batch["pc_stage1"].shape[-2]
+        pc_stage1 = batch["pc_stage1"].reshape(-1, patch_size, 3)
+        pc_surface_bank = batch.get("pc_surface_bank", None)
+        if pc_surface_bank is not None:
+            surface_bank_size = pc_surface_bank.shape[-2]
+            pc_surface_bank = pc_surface_bank.reshape(-1, surface_bank_size, 3)
+        pc_normal_proxy = batch.get("pc_normal_proxy", None)
+        if pc_normal_proxy is not None:
+            pc_normal_proxy = pc_normal_proxy.reshape(-1, patch_size, 3)
+        loss = self.get_distribution_loss(
+            pc_stage1=pc_stage1,
+            pc_surface_bank=pc_surface_bank,
+            pc_normal_proxy=pc_normal_proxy,
+        )
+        return {"loss": loss}
+
+    def execute(self, **kwargs) -> Dict:  # type: ignore
+        return self.training_step(**kwargs)
+
+    @jt.no_grad()
+    def predict_step(self, batch: Dict) -> List[Dict]:
+        pc_noisy_batch = batch["pc_noisy"]
+        assert pc_noisy_batch.ndim == 3
+
+        res = []
+        for pc_noisy in pc_noisy_batch:
+            pc_next = patch_based_denoise(
+                model=self,  # type: ignore[arg-type]
+                pcl_noisy=pc_noisy,
+                patch_size=self.predict_patch_size,
+                seed_k=self.predict_patch_seed_k,
+                seed_k_alpha=self.predict_patch_seed_k_alpha,
+                aggregation=self.predict_patch_aggregation,
+                weight_temperature=self.predict_patch_weight_temperature,
+            )
+            pc_denoised = pc_next.detach().numpy()
+            res.append({"pc_denoised": pc_denoised})
+        return res
+
+    def process_fn(self, batch: List[Asset]) -> List[Dict]:
+        res = []
+        for b in batch:
+            if not self.is_predict():
+                assert b.meta is not None
+                if "pc_stage1" not in b.meta:
+                    raise KeyError(
+                        f"{b.path} does not contain pc_stage1. "
+                        "Build a refine cache with tools/build_refine_cache.py first."
+                    )
+                d = {"pc_stage1": b.meta["pc_stage1"]}
+                if self.surface_bank_field in b.meta:
+                    d["pc_surface_bank"] = b.meta[self.surface_bank_field]
+                if self.normal_field in b.meta:
+                    d["pc_normal_proxy"] = b.meta[self.normal_field]
+                res.append(d)
+            else:
+                d = {"pc_noisy": b.sampled_vertices_noisy}
                 if b.sampled_vertices is not None:
                     d["pc_clean"] = b.sampled_vertices
                 res.append(d)

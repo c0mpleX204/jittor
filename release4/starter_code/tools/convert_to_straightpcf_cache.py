@@ -91,6 +91,10 @@ def convert_patch(
         for key in ("pc_edge_risk", "pc_normal"):
             if key in patch:
                 payload[key] = patch[key].astype(np.float32)
+        if "pc_surface_bank" in patch:
+            payload["pc_surface_bank"] = (
+                patch["pc_surface_bank"].astype(np.float32) - seed_shift
+            ).astype(np.float32)
         if "pc_center" in patch:
             payload["pc_center"] = (patch["pc_center"].astype(np.float32) + seed_shift[:, 0, :]).astype(np.float32)
     return payload
