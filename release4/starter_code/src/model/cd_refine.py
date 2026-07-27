@@ -1957,6 +1957,7 @@ class ScoreFieldRefineModule(TangentSpreadRefineModule):
         self.score_fallback_target_field = cfg.get("score_fallback_target_field", "pc_clean_corr")
         self.context_feature_k = cfg.get("context_feature_k", self.spread_k)
         self.context_reference_spacing_scale = cfg.get("context_reference_spacing_scale", 1.0)
+        self.distribution_spacing_source = cfg.get("distribution_spacing_source", "reference")
         self.hole_spacing_scale = cfg.get("hole_spacing_scale", 1.15)
         self.hole_power = cfg.get("hole_power", 1.0)
         self.hole_upper_scale = cfg.get("hole_upper_scale", 1.18)
@@ -2131,7 +2132,7 @@ class ScoreFieldRefineModule(TangentSpreadRefineModule):
                 query = query + float(self.query_jitter_normal_std) * normal_jitter * query_normal
         return query
 
-    def _surface_score_target(self, query, pc_target):
+    def _pointset_score_target(self, query, pc_target):
         pc_target = _sample_points(pc_target, self.score_target_points)
         k = min(int(self.score_target_avg_knn), pc_target.shape[1])
         if k <= 0:
@@ -2154,6 +2155,15 @@ class ScoreFieldRefineModule(TangentSpreadRefineModule):
             nearest = jt.sqrt(knn2[:, :, 0] + 1e-12)
             weight = jt.exp(-((nearest / float(self.score_target_radius)) ** 2.0))
         return target_score, weight
+
+    def _target_spacing_at_queries(self, query, pc_target, k: int):
+        target_spacing, _, _ = _local_spacing(pc_target, k)
+        if target_spacing is None:
+            return None
+        dist2 = ((query.unsqueeze(2) - pc_target.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        _, idx = jt.topk(dist2, k=1, dim=2, largest=False)
+        spacing = _gather_batched(target_spacing.unsqueeze(-1), idx)
+        return spacing.squeeze(2).squeeze(-1)
 
     def _apply_score_step(self, pc_current, pc_stage1, feat, extra, normal, step_scale):
         score = self._predict_score_from_context(
@@ -2228,7 +2238,7 @@ class ScoreFieldRefineModule(TangentSpreadRefineModule):
             feat,
             extra,
         )
-        target_score, target_weight = self._surface_score_target(query, pc_score_target)
+        target_score, target_weight = self._pointset_score_target(query, pc_score_target)
         score_loss = _weighted_mean(
             ((pred_score - target_score) ** 2.0).sum(dim=-1),
             target_weight,
@@ -2259,11 +2269,19 @@ class ScoreFieldRefineModule(TangentSpreadRefineModule):
         spacing_loss = 0.0
         hole_loss = 0.0
         final_knn = _self_knn_distances(pc_final_l, self.repulsion_k)
-        if final_knn is not None and pc_reference_l is not None:
-            normal_l = normal[:, idx, :] if idx is not None else normal
-            residual_tan, _ = _project_to_tangent(pc_reference_l - pc_stage1_l, normal_l)
-            pc_reference_tangent = pc_stage1_l + residual_tan
-            reference_spacing, _, _ = _local_spacing(pc_reference_tangent, self.repulsion_k)
+        if final_knn is not None:
+            reference_spacing = None
+            if self.distribution_spacing_source == "score_target":
+                reference_spacing = self._target_spacing_at_queries(
+                    pc_final_l,
+                    pc_score_target,
+                    self.repulsion_k,
+                )
+            elif pc_reference_l is not None:
+                normal_l = normal[:, idx, :] if idx is not None else normal
+                residual_tan, _ = _project_to_tangent(pc_reference_l - pc_stage1_l, normal_l)
+                pc_reference_tangent = pc_stage1_l + residual_tan
+                reference_spacing, _, _ = _local_spacing(pc_reference_tangent, self.repulsion_k)
             if reference_spacing is not None:
                 final_spacing = final_knn.mean(dim=2)
                 target_spacing = reference_spacing * float(self.spacing_target_scale)
@@ -2378,6 +2396,64 @@ class ScoreFieldRefineModule(TangentSpreadRefineModule):
                     d["pc_score_target"] = b.meta[self.score_fallback_target_field]
                 if self.normal_field in b.meta:
                     d["pc_normal_proxy"] = b.meta[self.normal_field]
+                res.append(d)
+            else:
+                d = {"pc_noisy": b.sampled_vertices_noisy}
+                if b.sampled_vertices is not None:
+                    d["pc_clean"] = b.sampled_vertices
+                res.append(d)
+        return res
+
+
+class PointSetScoreFieldRefineModule(ScoreFieldRefineModule):
+    """
+    Score-field refine with a clean point-set target.
+
+    This is the CD-oriented version: the main score target is a clean point set
+    such as pc_clean_corr/pc_clean, never pc_surface_bank. The noisy point cloud
+    is used as the degraded context/reference available at inference time.
+    """
+
+    def __init__(self, model_config, transform_config):
+        cfg = deepcopy(model_config)
+        cfg.setdefault("score_target_field", "pc_clean_corr")
+        cfg.setdefault("score_fallback_target_field", "pc_clean")
+        cfg.setdefault("distribution_spacing_source", "score_target")
+        cfg.setdefault("surface_bank_guard_weight", 0.0)
+        super().__init__(cfg, transform_config)
+
+    def process_fn(self, batch: List[Asset]) -> List[Dict]:
+        res = []
+        for b in batch:
+            if not self.is_predict():
+                assert b.meta is not None
+                if "pc_stage1" not in b.meta:
+                    raise KeyError(
+                        f"{b.path} does not contain pc_stage1. "
+                        "Build a refine cache with tools/build_refine_cache.py first."
+                    )
+                target_key = self.score_target_field
+                if target_key not in b.meta:
+                    target_key = self.score_fallback_target_field
+                if target_key not in b.meta:
+                    raise KeyError(
+                        f"{b.path} does not contain {self.score_target_field} or "
+                        f"{self.score_fallback_target_field} for point-set score training."
+                    )
+
+                d = {
+                    "pc_stage1": b.meta["pc_stage1"],
+                    "pc_score_target": b.meta[target_key],
+                }
+                if self.reference_field in b.meta:
+                    d["pc_reference"] = b.meta[self.reference_field]
+                if self.normal_field in b.meta:
+                    d["pc_normal_proxy"] = b.meta[self.normal_field]
+                if (
+                    self.surface_bank_guard_weight > 0 and
+                    self.surface_bank_field in b.meta
+                ):
+                    d["pc_surface_bank"] = b.meta[self.surface_bank_field]
                 res.append(d)
             else:
                 d = {"pc_noisy": b.sampled_vertices_noisy}
