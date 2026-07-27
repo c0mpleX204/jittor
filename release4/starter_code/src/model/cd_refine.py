@@ -410,6 +410,7 @@ def _tangent_spread_target(
 
     bandwidth = dist[:, :, -1:] + 1e-6
     weight = jt.exp(-((dist / bandwidth) ** 2.0))
+    rel = pc.unsqueeze(2) - neighbors
     direction = rel / (dist.unsqueeze(-1) + 1e-8)
     force = (weight.unsqueeze(-1) * direction).sum(dim=2)
     force_tan, _ = _project_to_tangent(force, normal)
