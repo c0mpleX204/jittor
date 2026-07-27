@@ -2405,22 +2405,165 @@ class ScoreFieldRefineModule(TangentSpreadRefineModule):
         return res
 
 
-class PointSetScoreFieldRefineModule(ScoreFieldRefineModule):
+class PairedNoisyScoreFieldRefineModule(ScoreFieldRefineModule):
     """
-    Score-field refine with a clean point-set target.
+    Score-field refine trained on noisy-to-clean correspondence.
 
-    This is the CD-oriented version: the main score target is a clean point set
-    such as pc_clean_corr/pc_clean, never pc_surface_bank. The noisy point cloud
-    is used as the degraded context/reference available at inference time.
+    The query is sampled from pc_stage1 by index. The target is the same-index
+    clean counterpart, typically pc_clean_corr. This keeps pc_noisy as the
+    inference-available signal that explains where each stage-1 point came from,
+    instead of using nearest surface/GT points as the main target.
     """
 
     def __init__(self, model_config, transform_config):
         cfg = deepcopy(model_config)
         cfg.setdefault("score_target_field", "pc_clean_corr")
         cfg.setdefault("score_fallback_target_field", "pc_clean")
-        cfg.setdefault("distribution_spacing_source", "score_target")
+        cfg.setdefault("distribution_spacing_source", "paired_target")
         cfg.setdefault("surface_bank_guard_weight", 0.0)
         super().__init__(cfg, transform_config)
+        self.paired_final_loss_weight = cfg.get("paired_final_loss_weight", 0.0)
+
+    def _sample_paired_queries(self, pc_stage1, normal, pc_target):
+        if pc_target.shape[1] != pc_stage1.shape[1]:
+            raise ValueError(
+                "Paired noisy score training needs same-index targets: "
+                f"pc_stage1 has {pc_stage1.shape[1]} points, "
+                f"pc_score_target has {pc_target.shape[1]} points."
+            )
+        idx = _random_indices(pc_stage1.shape[1], self.score_query_points)
+        if idx is None:
+            query = pc_stage1
+            query_normal = normal
+            target = pc_target
+        else:
+            query = pc_stage1[:, idx, :]
+            query_normal = normal[:, idx, :]
+            target = pc_target[:, idx, :]
+
+        if self.query_jitter_tangent_std > 0 or self.query_jitter_normal_std > 0:
+            jitter = jt.randn(query.shape)
+            jitter_tan, _ = _project_to_tangent(jitter, query_normal)
+            query = query + float(self.query_jitter_tangent_std) * jitter_tan
+            if self.query_jitter_normal_std > 0:
+                normal_jitter = jt.randn((query.shape[0], query.shape[1], 1))
+                query = query + float(self.query_jitter_normal_std) * normal_jitter * query_normal
+        return idx, query, target
+
+    def _paired_score_target(self, query, pc_target):
+        target_score = pc_target - query
+        if self.score_target_max_step and self.score_target_max_step > 0:
+            norm = jt.sqrt((target_score ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
+            target_score = target_score * jt.minimum(
+                jt.ones_like(norm),
+                jt.ones_like(norm) * float(self.score_target_max_step) / (norm + 1e-8),
+            )
+        return target_score, jt.ones((query.shape[0], query.shape[1]))
+
+    def get_distribution_loss(
+        self,
+        pc_stage1,
+        pc_score_target,
+        pc_surface_bank=None,
+        pc_normal_proxy=None,
+        pc_reference=None,
+    ):
+        if pc_reference is None:
+            raise KeyError(
+                "PairedNoisyScoreFieldRefineModule requires pc_noisy/pc_reference. "
+                "This route must learn from the noisy-stage1 correspondence, "
+                "not from stage1 alone."
+            )
+        normal, feat, extra = self._build_context_state(
+            pc_stage1,
+            pc_reference=pc_reference,
+            pc_normal_proxy=pc_normal_proxy,
+        )
+        idx, query, target_query = self._sample_paired_queries(
+            pc_stage1,
+            normal,
+            pc_score_target,
+        )
+        pred_score = self._predict_score_from_context(
+            query,
+            pc_stage1,
+            feat,
+            extra,
+        )
+        target_score, target_weight = self._paired_score_target(query, target_query)
+        score_loss = _weighted_mean(
+            ((pred_score - target_score) ** 2.0).sum(dim=-1),
+            target_weight,
+        )
+
+        pc_final, delta, _, normal, normal_dot = self._refine_with_context(
+            pc_stage1,
+            feat,
+            extra,
+            normal,
+        )
+
+        idx_l = _random_indices(pc_stage1.shape[1], self.loss_num_points)
+        if idx_l is not None:
+            pc_final_l = pc_final[:, idx_l, :]
+            delta_l = delta[:, idx_l, :]
+            normal_dot_l = normal_dot[:, idx_l, :]
+            pc_target_l = pc_score_target[:, idx_l, :]
+        else:
+            pc_final_l = pc_final
+            delta_l = delta
+            normal_dot_l = normal_dot
+            pc_target_l = pc_score_target
+
+        repulsion_loss = 0.0
+        spacing_loss = 0.0
+        hole_loss = 0.0
+        final_knn = _self_knn_distances(pc_final_l, self.repulsion_k)
+        target_spacing, _, _ = _local_spacing(pc_target_l, self.repulsion_k)
+        if final_knn is not None and target_spacing is not None:
+            final_spacing = final_knn.mean(dim=2)
+            target_spacing = target_spacing * float(self.spacing_target_scale)
+            min_radius = target_spacing.unsqueeze(-1) * float(self.repulsion_radius_scale)
+            close = jt.maximum(min_radius - final_knn, jt.zeros_like(final_knn))
+            repulsion_loss = (close ** 2.0).mean()
+            shortfall = jt.maximum(
+                target_spacing - final_spacing,
+                jt.zeros_like(final_spacing),
+            )
+            spacing_loss = (shortfall ** 2.0).mean()
+            upper = target_spacing * float(self.hole_upper_scale)
+            excess = jt.maximum(
+                final_spacing - upper,
+                jt.zeros_like(final_spacing),
+            )
+            hole_loss = (excess ** 2.0).mean()
+
+        paired_final = ((pc_final_l - pc_target_l) ** 2.0).sum(dim=-1).mean()
+        normal_delta = (normal_dot_l.squeeze(-1) ** 2.0).mean()
+        anchor = (delta_l ** 2.0).sum(dim=-1).mean()
+
+        surface_bank_guard = 0.0
+        if self.surface_bank_guard_weight > 0 and pc_surface_bank is not None:
+            surface_bank_guard = _surface_bank_guard_loss(
+                pc_stage1=pc_stage1,
+                pc_final=pc_final,
+                pc_surface_bank=pc_surface_bank,
+                num_points=self.surface_bank_guard_num_points,
+                bank_num_points=self.surface_bank_guard_bank_points,
+                margin=self.surface_bank_guard_margin,
+            )
+
+        loss = (
+            self.score_loss_weight * score_loss +
+            self.paired_final_loss_weight * paired_final +
+            self.repulsion_loss_weight * repulsion_loss +
+            self.spacing_loss_weight * spacing_loss +
+            self.hole_loss_weight * hole_loss +
+            self.normal_delta_weight * normal_delta +
+            self.anchor_loss_weight * anchor +
+            self.surface_bank_guard_weight * surface_bank_guard
+        ) / self.dsm_sigma
+        return loss
 
     def process_fn(self, batch: List[Asset]) -> List[Dict]:
         res = []
@@ -2438,15 +2581,19 @@ class PointSetScoreFieldRefineModule(ScoreFieldRefineModule):
                 if target_key not in b.meta:
                     raise KeyError(
                         f"{b.path} does not contain {self.score_target_field} or "
-                        f"{self.score_fallback_target_field} for point-set score training."
+                        f"{self.score_fallback_target_field} for paired noisy score training."
                     )
-
                 d = {
                     "pc_stage1": b.meta["pc_stage1"],
                     "pc_score_target": b.meta[target_key],
                 }
                 if self.reference_field in b.meta:
                     d["pc_reference"] = b.meta[self.reference_field]
+                else:
+                    raise KeyError(
+                        f"{b.path} does not contain {self.reference_field}; "
+                        "paired noisy score training needs pc_noisy as input context."
+                    )
                 if self.normal_field in b.meta:
                     d["pc_normal_proxy"] = b.meta[self.normal_field]
                 if (
