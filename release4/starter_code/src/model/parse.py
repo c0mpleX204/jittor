@@ -2,6 +2,7 @@ from .spec import ModelSpec
 from .cd_refine import (
     CDRefineModule,
     LocalAttentionCDRefineModule,
+    NoisyGuidedAlphaRefineModule,
     RiskAwareCDRefineModule,
     TangentSpreadRefineModule,
     TangentialCDRefineModule,
@@ -23,6 +24,7 @@ def get_model(model_config, **kwargs) -> ModelSpec:
         'DirectionDistanceVelocityModule': DirectionDistanceVelocityModule,
         'EdgeRefineModule': EdgeRefineModule,
         'LocalAttentionCDRefineModule': LocalAttentionCDRefineModule,
+        'NoisyGuidedAlphaRefineModule': NoisyGuidedAlphaRefineModule,
         'RiskAwareCDRefineModule': RiskAwareCDRefineModule,
         'TangentSpreadRefineModule': TangentSpreadRefineModule,
         'StraightPCFCoupledVelocityModule': StraightPCFCoupledVelocityModule,
