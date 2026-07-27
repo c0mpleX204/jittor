@@ -1957,6 +1957,9 @@ class ScoreFieldRefineModule(TangentSpreadRefineModule):
         self.score_fallback_target_field = cfg.get("score_fallback_target_field", "pc_clean_corr")
         self.context_feature_k = cfg.get("context_feature_k", self.spread_k)
         self.context_reference_spacing_scale = cfg.get("context_reference_spacing_scale", 1.0)
+        self.hole_spacing_scale = cfg.get("hole_spacing_scale", 1.15)
+        self.hole_power = cfg.get("hole_power", 1.0)
+        self.hole_upper_scale = cfg.get("hole_upper_scale", 1.18)
 
         self.repulsion_loss_weight = cfg.get("repulsion_loss_weight", 0.08)
         self.spacing_loss_weight = cfg.get("spacing_loss_weight", 0.04)
