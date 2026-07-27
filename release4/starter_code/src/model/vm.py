@@ -250,22 +250,21 @@ def patch_based_denoise(
         temp = max(float(weight_temperature), 1e-6)
         weighted_sum = pcl_noisy[0] * float(weight_floor)
         weight_sum = jt.ones((N, 1)) * float(weight_floor)
-        for i in range(num_patches):
-            idx = point_idxs[i]
-            patch_weights = jt.exp(-patch_dists[i] / temp).unsqueeze(1)
-            weighted = patches_denoised[i] * patch_weights
-            weighted_sum = weighted_sum.scatter_(
-                0,
-                idx.unsqueeze(1).broadcast(weighted.shape),
-                weighted,
-                reduce='add',
-            )
-            weight_sum = weight_sum.scatter_(
-                0,
-                idx.unsqueeze(1),
-                patch_weights,
-                reduce='add',
-            )
+        idx = point_idxs.reshape(-1)
+        patch_weights = jt.exp(-patch_dists / temp).unsqueeze(-1)
+        weighted = (patches_denoised * patch_weights).reshape(-1, d)
+        weighted_sum = weighted_sum.scatter_(
+            0,
+            idx.unsqueeze(1).broadcast(weighted.shape),
+            weighted,
+            reduce='add',
+        )
+        weight_sum = weight_sum.scatter_(
+            0,
+            idx.unsqueeze(1),
+            patch_weights.reshape(-1, 1),
+            reduce='add',
+        )
         pcl_out = weighted_sum / (weight_sum + 1e-12)
         assert pcl_out.shape[0] == N, f"denoised point count mismatch: {pcl_out.shape[0]} != {N}"
         return pcl_out
