@@ -122,6 +122,30 @@ def _knn_neighbors(pc, k: int):
     return pc_flat[idx_flat].reshape(B, N, k, 3)
 
 
+def _gather_batched(points, idx):
+    B, N, C = points.shape
+    idx_shape = idx.shape
+    base = (jt.arange(B) * N).reshape(B, 1, 1)
+    while len(base.shape) < len(idx_shape):
+        base = base.unsqueeze(-1)
+    idx_flat = (idx + base).reshape(-1)
+    points_flat = points.reshape(B * N, C)
+    return points_flat[idx_flat].reshape(*idx_shape, C)
+
+
+def _query_context_neighbors(query, context, k: int):
+    B, _, _ = query.shape
+    _, N, _ = context.shape
+    k = min(int(k), N)
+    if k <= 0:
+        return None, None, None
+    idx = get_knn_idx(query, context, k, offset=0)
+    neighbors = _gather_batched(context, idx)
+    rel = neighbors - query.unsqueeze(2)
+    dist = jt.sqrt((rel ** 2.0).sum(dim=-1) + 1e-12)
+    return idx, neighbors, dist
+
+
 def _radius_risk_from_neighbors(pc, neighbors):
     delta = neighbors - pc.unsqueeze(2)
     dist2 = (delta ** 2.0).sum(dim=-1)
@@ -1893,6 +1917,471 @@ class DirectionCorrectedNoisyGuidedRefineModule(NoisyGuidedAlphaRefineModule):
         else:
             normal_dot = (delta * normal).sum(dim=-1, keepdims=True)
         return pc_stage1 + delta, delta, guide, normal, normal_dot, alpha
+
+
+class ScoreFieldRefineModule(TangentSpreadRefineModule):
+    """
+    Query-conditioned score-field refinement.
+
+    This follows the useful part of Score-Denoise / Deep-RS: train a vector
+    field on query positions around stage-1 points, then refine by several
+    small gradient-ascent style steps. No GT or surface bank is required at
+    prediction time.
+    """
+
+    def __init__(self, model_config, transform_config):
+        super().__init__(model_config, transform_config)
+        cfg = self.model_config
+
+        self.score_context_knn = cfg.get("score_context_knn", 24)
+        self.score_radius = cfg.get("score_radius", 0.12)
+        self.score_hidden_dim = cfg.get("score_hidden_dim", self.decoder_hidden_dim)
+        self.score_query_points = cfg.get("score_query_points", self.loss_num_points)
+        self.score_target_points = cfg.get("score_target_points", 2048)
+        self.score_target_avg_knn = cfg.get("score_target_avg_knn", 4)
+        self.score_target_max_step = cfg.get("score_target_max_step", 0.035)
+        self.score_target_radius = cfg.get("score_target_radius", 0.0)
+        self.score_loss_weight = cfg.get("score_loss_weight", 1.0)
+
+        self.query_jitter_tangent_std = cfg.get("query_jitter_tangent_std", 0.006)
+        self.query_jitter_normal_std = cfg.get("query_jitter_normal_std", 0.002)
+
+        self.score_steps = cfg.get("score_steps", 4)
+        self.score_step_size = cfg.get("score_step_size", 0.35)
+        self.score_step_decay = cfg.get("score_step_decay", 0.72)
+        self.score_step_cap = cfg.get("score_step_cap", self.delta_scale)
+        self.score_total_cap = cfg.get("score_total_cap", 0.035)
+        self.normal_step_scale = cfg.get("normal_step_scale", 0.45)
+
+        self.score_target_field = cfg.get("score_target_field", "pc_surface_bank")
+        self.score_fallback_target_field = cfg.get("score_fallback_target_field", "pc_clean_corr")
+        self.context_feature_k = cfg.get("context_feature_k", self.spread_k)
+        self.context_reference_spacing_scale = cfg.get("context_reference_spacing_scale", 1.0)
+
+        self.repulsion_loss_weight = cfg.get("repulsion_loss_weight", 0.08)
+        self.spacing_loss_weight = cfg.get("spacing_loss_weight", 0.04)
+        self.hole_loss_weight = cfg.get("hole_loss_weight", 0.04)
+        self.normal_delta_weight = cfg.get("normal_delta_weight", 0.25)
+        self.anchor_loss_weight = cfg.get("anchor_loss_weight", 0.02)
+        self.surface_bank_guard_weight = cfg.get("surface_bank_guard_weight", 0.35)
+        self.surface_bank_guard_margin = cfg.get("surface_bank_guard_margin", 0.00004)
+
+        self.score_extra_dim = 10
+        point_in_dim = self.encoder.embedding_dim + self.score_extra_dim + 4
+        hidden = self.score_hidden_dim
+        self.score_point_lin_1 = nn.Linear(point_in_dim, hidden)
+        self.score_point_bn_1 = nn.BatchNorm1d(hidden)
+        self.score_point_lin_2 = nn.Linear(hidden, hidden)
+        self.score_point_bn_2 = nn.BatchNorm1d(hidden)
+        self.score_global_lin_1 = nn.Linear(hidden, hidden)
+        self.score_global_bn_1 = nn.BatchNorm1d(hidden)
+        self.score_global_lin_2 = nn.Linear(hidden, hidden)
+        self.score_global_bn_2 = nn.BatchNorm1d(hidden)
+        self.score_global_lin_3 = nn.Linear(hidden, 3)
+        self.score_act = nn.ReLU()
+        self._freeze_unused_delta_decoder()
+
+    def _freeze_unused_delta_decoder(self):
+        for param in self.decoder.parameters():
+            if hasattr(param, "stop_grad"):
+                param.stop_grad()
+            if hasattr(param, "requires_grad"):
+                param.requires_grad = False
+
+    def _context_extra(self, pc_stage1, normal, pc_reference=None):
+        B, N, _ = pc_stage1.shape
+        zero = jt.zeros((B, N, 1))
+        zero_vec = jt.zeros_like(pc_stage1)
+
+        stage_spacing, _, _ = _local_spacing(pc_stage1, self.context_feature_k)
+        if stage_spacing is None:
+            stage_spacing = jt.ones((B, N)) * 1e-3
+
+        if pc_reference is None:
+            residual_tan = zero_vec
+            residual_normal_abs = zero
+            reference_spacing = stage_spacing
+        else:
+            residual = pc_reference - pc_stage1
+            residual_tan, residual_normal = _project_to_tangent(residual, normal)
+            residual_normal_abs = jt.abs(residual_normal)
+            pc_reference_tangent = pc_stage1 + residual_tan
+            reference_spacing, _, _ = _local_spacing(pc_reference_tangent, self.context_feature_k)
+            if reference_spacing is None:
+                reference_spacing = stage_spacing
+
+        residual_norm = jt.sqrt((residual_tan ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
+        stage_spacing_u = stage_spacing.unsqueeze(-1)
+        reference_spacing_u = reference_spacing.unsqueeze(-1)
+        spacing_ratio = stage_spacing_u / (reference_spacing_u + 1e-8)
+        dense = jt.maximum(
+            (reference_spacing_u * float(self.context_reference_spacing_scale) - stage_spacing_u) /
+            (reference_spacing_u + 1e-8),
+            jt.zeros_like(stage_spacing_u),
+        )
+        sparse = jt.maximum(
+            (stage_spacing_u - reference_spacing_u * float(self.hole_spacing_scale)) /
+            (reference_spacing_u + 1e-8),
+            jt.zeros_like(stage_spacing_u),
+        )
+
+        return jt.concat(
+            [
+                residual_tan,
+                residual_norm,
+                residual_normal_abs,
+                stage_spacing_u,
+                reference_spacing_u,
+                spacing_ratio,
+                dense,
+                sparse,
+            ],
+            dim=-1,
+        )
+
+    def _score_weights(self, dist):
+        if self.score_radius and self.score_radius > 0:
+            ratio = jt.minimum(
+                dist / float(self.score_radius),
+                jt.ones_like(dist),
+            )
+            weight = 0.5 * (jt.cos(ratio * np.pi) + 1.0)
+            weight = weight * (dist <= float(self.score_radius)).float32()
+        else:
+            bandwidth = dist[:, :, -1:] + 1e-6
+            weight = jt.exp(-((dist / bandwidth) ** 2.0))
+        weight = weight * (dist > 1e-8).float32()
+        return weight
+
+    def _build_context_state(self, pc_stage1, pc_reference=None, pc_normal_proxy=None):
+        normal = self._normal_proxy(pc_stage1, pc_normal_proxy=pc_normal_proxy)
+        feat = self.encoder(pc_stage1)
+        extra = self._context_extra(
+            pc_stage1,
+            normal,
+            pc_reference=pc_reference,
+        )
+        return normal, feat, extra
+
+    def _predict_score_from_context(self, query, pc_stage1, feat, extra):
+        B, Q, _ = query.shape
+        idx, neighbors, dist = _query_context_neighbors(
+            query,
+            pc_stage1,
+            self.score_context_knn,
+        )
+        if idx is None:
+            return jt.zeros_like(query)
+
+        feat_group = _gather_batched(feat, idx)
+        extra_group = _gather_batched(extra, idx)
+        rel = neighbors - query.unsqueeze(2)
+        point_input = jt.concat(
+            [rel, dist.unsqueeze(-1), feat_group, extra_group],
+            dim=-1,
+        )
+
+        net = point_input.reshape(B * Q * idx.shape[2], -1)
+        net = self.score_point_lin_1(net)
+        net = self.score_point_bn_1(net)
+        net = self.score_act(net)
+        net = self.score_point_lin_2(net)
+        net = self.score_point_bn_2(net)
+        net = self.score_act(net)
+        net = net.reshape(B, Q, idx.shape[2], -1)
+
+        weight = self._score_weights(dist).unsqueeze(-1)
+        agg = (net * weight).sum(dim=2) / (weight.sum(dim=2) + 1e-6)
+        out = agg.reshape(B * Q, -1)
+        out = self.score_global_lin_1(out)
+        out = self.score_global_bn_1(out)
+        out = self.score_act(out)
+        out = self.score_global_lin_2(out)
+        out = self.score_global_bn_2(out)
+        out = self.score_act(out)
+        out = self.score_global_lin_3(out).reshape(B, Q, 3)
+        return out
+
+    def predict_score(self, query, pc_stage1, pc_reference=None, pc_normal_proxy=None):
+        _, feat, extra = self._build_context_state(
+            pc_stage1,
+            pc_reference=pc_reference,
+            pc_normal_proxy=pc_normal_proxy,
+        )
+        return self._predict_score_from_context(query, pc_stage1, feat, extra)
+
+    def _sample_queries(self, pc_stage1, normal):
+        idx = _random_indices(pc_stage1.shape[1], self.score_query_points)
+        if idx is None:
+            query = pc_stage1
+            query_normal = normal
+        else:
+            query = pc_stage1[:, idx, :]
+            query_normal = normal[:, idx, :]
+
+        if self.query_jitter_tangent_std > 0 or self.query_jitter_normal_std > 0:
+            jitter = jt.randn(query.shape)
+            jitter_tan, _ = _project_to_tangent(jitter, query_normal)
+            query = query + float(self.query_jitter_tangent_std) * jitter_tan
+            if self.query_jitter_normal_std > 0:
+                normal_jitter = jt.randn((query.shape[0], query.shape[1], 1))
+                query = query + float(self.query_jitter_normal_std) * normal_jitter * query_normal
+        return query
+
+    def _surface_score_target(self, query, pc_target):
+        pc_target = _sample_points(pc_target, self.score_target_points)
+        k = min(int(self.score_target_avg_knn), pc_target.shape[1])
+        if k <= 0:
+            return jt.zeros_like(query), jt.ones((query.shape[0], query.shape[1]))
+
+        dist2 = ((query.unsqueeze(2) - pc_target.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        knn2, idx = jt.topk(dist2, k=k, dim=2, largest=False)
+        target_nbs = _gather_batched(pc_target, idx)
+        target_score = target_nbs.mean(dim=2) - query
+
+        if self.score_target_max_step and self.score_target_max_step > 0:
+            norm = jt.sqrt((target_score ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
+            target_score = target_score * jt.minimum(
+                jt.ones_like(norm),
+                jt.ones_like(norm) * float(self.score_target_max_step) / (norm + 1e-8),
+            )
+
+        weight = jt.ones((query.shape[0], query.shape[1]))
+        if self.score_target_radius and self.score_target_radius > 0:
+            nearest = jt.sqrt(knn2[:, :, 0] + 1e-12)
+            weight = jt.exp(-((nearest / float(self.score_target_radius)) ** 2.0))
+        return target_score, weight
+
+    def _apply_score_step(self, pc_current, pc_stage1, feat, extra, normal, step_scale):
+        score = self._predict_score_from_context(
+            pc_current,
+            pc_stage1,
+            feat,
+            extra,
+        )
+        score_tan, normal_dot = _project_to_tangent(score, normal)
+        score = score_tan + float(self.normal_step_scale) * normal_dot * normal
+        delta_step = float(step_scale) * score
+        if self.score_step_cap and self.score_step_cap > 0:
+            norm = jt.sqrt((delta_step ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
+            delta_step = delta_step * jt.minimum(
+                jt.ones_like(norm),
+                jt.ones_like(norm) * float(self.score_step_cap) / (norm + 1e-8),
+            )
+        return delta_step, score
+
+    def _refine_with_context(self, pc_stage1, feat, extra, normal):
+        pc_current = pc_stage1
+        last_score = jt.zeros_like(pc_stage1)
+        step = float(self.score_step_size)
+        for _ in range(int(self.score_steps)):
+            delta_step, last_score = self._apply_score_step(
+                pc_current,
+                pc_stage1,
+                feat,
+                extra,
+                normal,
+                step,
+            )
+            pc_current = pc_current + delta_step
+            step *= float(self.score_step_decay)
+
+        delta = pc_current - pc_stage1
+        if self.score_total_cap and self.score_total_cap > 0:
+            norm = jt.sqrt((delta ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
+            delta = delta * jt.minimum(
+                jt.ones_like(norm),
+                jt.ones_like(norm) * float(self.score_total_cap) / (norm + 1e-8),
+            )
+            pc_current = pc_stage1 + delta
+        _, normal_dot = _project_to_tangent(delta, normal)
+        return pc_current, delta, last_score, normal, normal_dot
+
+    def refine(self, pc_stage1, pc_normal_proxy=None, pc_reference=None):
+        normal, feat, extra = self._build_context_state(
+            pc_stage1,
+            pc_reference=pc_reference,
+            pc_normal_proxy=pc_normal_proxy,
+        )
+        return self._refine_with_context(pc_stage1, feat, extra, normal)
+
+    def get_distribution_loss(
+        self,
+        pc_stage1,
+        pc_score_target,
+        pc_surface_bank=None,
+        pc_normal_proxy=None,
+        pc_reference=None,
+    ):
+        normal, feat, extra = self._build_context_state(
+            pc_stage1,
+            pc_reference=pc_reference,
+            pc_normal_proxy=pc_normal_proxy,
+        )
+        query = self._sample_queries(pc_stage1, normal)
+        pred_score = self._predict_score_from_context(
+            query,
+            pc_stage1,
+            feat,
+            extra,
+        )
+        target_score, target_weight = self._surface_score_target(query, pc_score_target)
+        score_loss = _weighted_mean(
+            ((pred_score - target_score) ** 2.0).sum(dim=-1),
+            target_weight,
+        )
+
+        pc_final, delta, _, normal, normal_dot = self._refine_with_context(
+            pc_stage1,
+            feat,
+            extra,
+            normal,
+        )
+
+        idx = _random_indices(pc_stage1.shape[1], self.loss_num_points)
+        if idx is not None:
+            pc_stage1_l = pc_stage1[:, idx, :]
+            pc_final_l = pc_final[:, idx, :]
+            delta_l = delta[:, idx, :]
+            normal_dot_l = normal_dot[:, idx, :]
+            pc_reference_l = pc_reference[:, idx, :] if pc_reference is not None else None
+        else:
+            pc_stage1_l = pc_stage1
+            pc_final_l = pc_final
+            delta_l = delta
+            normal_dot_l = normal_dot
+            pc_reference_l = pc_reference
+
+        repulsion_loss = 0.0
+        spacing_loss = 0.0
+        hole_loss = 0.0
+        final_knn = _self_knn_distances(pc_final_l, self.repulsion_k)
+        if final_knn is not None and pc_reference_l is not None:
+            normal_l = normal[:, idx, :] if idx is not None else normal
+            residual_tan, _ = _project_to_tangent(pc_reference_l - pc_stage1_l, normal_l)
+            pc_reference_tangent = pc_stage1_l + residual_tan
+            reference_spacing, _, _ = _local_spacing(pc_reference_tangent, self.repulsion_k)
+            if reference_spacing is not None:
+                final_spacing = final_knn.mean(dim=2)
+                target_spacing = reference_spacing * float(self.spacing_target_scale)
+                min_radius = target_spacing.unsqueeze(-1) * float(self.repulsion_radius_scale)
+                close = jt.maximum(min_radius - final_knn, jt.zeros_like(final_knn))
+                repulsion_loss = (close ** 2.0).mean()
+                shortfall = jt.maximum(
+                    target_spacing - final_spacing,
+                    jt.zeros_like(final_spacing),
+                )
+                spacing_loss = (shortfall ** 2.0).mean()
+                upper = reference_spacing * float(self.hole_upper_scale)
+                excess = jt.maximum(
+                    final_spacing - upper,
+                    jt.zeros_like(final_spacing),
+                )
+                hole_loss = (excess ** 2.0).mean()
+
+        normal_delta = (normal_dot_l.squeeze(-1) ** 2.0).mean()
+        anchor = (delta_l ** 2.0).sum(dim=-1).mean()
+
+        surface_bank_guard = 0.0
+        if self.surface_bank_guard_weight > 0 and pc_surface_bank is not None:
+            surface_bank_guard = _surface_bank_guard_loss(
+                pc_stage1=pc_stage1,
+                pc_final=pc_final,
+                pc_surface_bank=pc_surface_bank,
+                num_points=self.surface_bank_guard_num_points,
+                bank_num_points=self.surface_bank_guard_bank_points,
+                margin=self.surface_bank_guard_margin,
+            )
+
+        loss = (
+            self.score_loss_weight * score_loss +
+            self.repulsion_loss_weight * repulsion_loss +
+            self.spacing_loss_weight * spacing_loss +
+            self.hole_loss_weight * hole_loss +
+            self.normal_delta_weight * normal_delta +
+            self.anchor_loss_weight * anchor +
+            self.surface_bank_guard_weight * surface_bank_guard
+        ) / self.dsm_sigma
+        return loss
+
+    def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=None):
+        with jt.no_grad():
+            pc_stage1 = self._run_stage1(pcl_noisy, num_steps=num_steps)
+            pc_final, delta, _, _, _ = self.refine(
+                pc_stage1,
+                pc_reference=pcl_noisy,
+            )
+        return pc_final, delta
+
+    def training_step(self, batch: Dict) -> Dict:
+        patch_size = batch["pc_stage1"].shape[-2]
+        pc_stage1 = batch["pc_stage1"].reshape(-1, patch_size, 3)
+
+        pc_reference = batch.get("pc_reference", None)
+        if pc_reference is not None:
+            pc_reference = pc_reference.reshape(-1, patch_size, 3)
+
+        pc_surface_bank = batch.get("pc_surface_bank", None)
+        if pc_surface_bank is not None:
+            surface_bank_size = pc_surface_bank.shape[-2]
+            pc_surface_bank = pc_surface_bank.reshape(-1, surface_bank_size, 3)
+
+        pc_score_target = batch.get("pc_score_target", None)
+        if pc_score_target is not None:
+            target_size = pc_score_target.shape[-2]
+            pc_score_target = pc_score_target.reshape(-1, target_size, 3)
+        elif pc_surface_bank is not None:
+            pc_score_target = pc_surface_bank
+        else:
+            raise KeyError(
+                "ScoreFieldRefineModule needs pc_surface_bank or pc_score_target "
+                "in the refine cache."
+            )
+
+        pc_normal_proxy = batch.get("pc_normal_proxy", None)
+        if pc_normal_proxy is not None:
+            pc_normal_proxy = pc_normal_proxy.reshape(-1, patch_size, 3)
+
+        loss = self.get_distribution_loss(
+            pc_stage1=pc_stage1,
+            pc_score_target=pc_score_target,
+            pc_surface_bank=pc_surface_bank,
+            pc_normal_proxy=pc_normal_proxy,
+            pc_reference=pc_reference,
+        )
+        return {"loss": loss}
+
+    def execute(self, **kwargs) -> Dict:  # type: ignore
+        return self.training_step(**kwargs)
+
+    def process_fn(self, batch: List[Asset]) -> List[Dict]:
+        res = []
+        for b in batch:
+            if not self.is_predict():
+                assert b.meta is not None
+                if "pc_stage1" not in b.meta:
+                    raise KeyError(
+                        f"{b.path} does not contain pc_stage1. "
+                        "Build a refine cache with tools/build_refine_cache.py first."
+                    )
+                d = {"pc_stage1": b.meta["pc_stage1"]}
+                if self.reference_field in b.meta:
+                    d["pc_reference"] = b.meta[self.reference_field]
+                if self.surface_bank_field in b.meta:
+                    d["pc_surface_bank"] = b.meta[self.surface_bank_field]
+                if self.score_target_field in b.meta:
+                    d["pc_score_target"] = b.meta[self.score_target_field]
+                elif self.score_fallback_target_field in b.meta:
+                    d["pc_score_target"] = b.meta[self.score_fallback_target_field]
+                if self.normal_field in b.meta:
+                    d["pc_normal_proxy"] = b.meta[self.normal_field]
+                res.append(d)
+            else:
+                d = {"pc_noisy": b.sampled_vertices_noisy}
+                if b.sampled_vertices is not None:
+                    d["pc_clean"] = b.sampled_vertices
+                res.append(d)
+        return res
 
 
 class TangentialCDRefineModule(CDRefineModule):

@@ -5,6 +5,7 @@ from .cd_refine import (
     LocalAttentionCDRefineModule,
     NoisyGuidedAlphaRefineModule,
     RiskAwareCDRefineModule,
+    ScoreFieldRefineModule,
     TangentSpreadRefineModule,
     TangentialCDRefineModule,
 )
@@ -28,6 +29,7 @@ def get_model(model_config, **kwargs) -> ModelSpec:
         'LocalAttentionCDRefineModule': LocalAttentionCDRefineModule,
         'NoisyGuidedAlphaRefineModule': NoisyGuidedAlphaRefineModule,
         'RiskAwareCDRefineModule': RiskAwareCDRefineModule,
+        'ScoreFieldRefineModule': ScoreFieldRefineModule,
         'TangentSpreadRefineModule': TangentSpreadRefineModule,
         'StraightPCFCoupledVelocityModule': StraightPCFCoupledVelocityModule,
         'StraightPCFVelocityDistanceModule': StraightPCFVelocityDistanceModule,
