@@ -1,18 +1,10 @@
 from .spec import ModelSpec
 from .cd_refine import (
     CDRefineModule,
-    DirectionCorrectedNoisyGuidedRefineModule,
-    LocalAttentionCDRefineModule,
-    NoisyGuidedAlphaRefineModule,
     NoisyAnchorScoreFieldRefineModule,
-    RiskAwareCDRefineModule,
-    TangentSpreadRefineModule,
     TangentialCDRefineModule,
 )
-from .coupled_vm import CoupledSurfaceStraightVelocityModule
 from .dcvm import DirectionDistanceVelocityModule
-from .distance_vm import StraightPCFDistanceVelocityModule
-from .edge_refine import EdgeRefineModule
 from .straightpcf_vm_dm import (
     StraightPCFCoupledVelocityModule,
     StraightPCFVelocityDistanceModule,
@@ -21,19 +13,11 @@ from .vm import VelocityModule
 
 def get_model(model_config, **kwargs) -> ModelSpec:
     MAP = {
-        'CoupledSurfaceStraightVelocityModule': CoupledSurfaceStraightVelocityModule,
         'CDRefineModule': CDRefineModule,
-        'DirectionCorrectedNoisyGuidedRefineModule': DirectionCorrectedNoisyGuidedRefineModule,
         'DirectionDistanceVelocityModule': DirectionDistanceVelocityModule,
-        'EdgeRefineModule': EdgeRefineModule,
-        'LocalAttentionCDRefineModule': LocalAttentionCDRefineModule,
         'NoisyAnchorScoreFieldRefineModule': NoisyAnchorScoreFieldRefineModule,
-        'NoisyGuidedAlphaRefineModule': NoisyGuidedAlphaRefineModule,
-        'RiskAwareCDRefineModule': RiskAwareCDRefineModule,
-        'TangentSpreadRefineModule': TangentSpreadRefineModule,
         'StraightPCFCoupledVelocityModule': StraightPCFCoupledVelocityModule,
         'StraightPCFVelocityDistanceModule': StraightPCFVelocityDistanceModule,
-        'StraightPCFDistanceVelocityModule': StraightPCFDistanceVelocityModule,
         'TangentialCDRefineModule': TangentialCDRefineModule,
         'VelocityModule': VelocityModule,
     }

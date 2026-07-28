@@ -30,10 +30,9 @@ class StraightPCFCoupledVelocityModule(ModelSpec):
     """
     Official-style StraightPCF coupled velocity stage.
 
-    Compared with the earlier CoupledSurfaceStraightVelocityModule, this uses
-    the patch interpolation time t. Each VM learns the same straight velocity,
-    but is trained on a different segment from current t toward the clean
-    endpoint.
+    Official-style coupled velocity stage with patch interpolation time t.
+    Each VM learns the same straight velocity, but is trained on a different
+    segment from current t toward the clean endpoint.
     """
 
     def __init__(self, model_config, transform_config):
