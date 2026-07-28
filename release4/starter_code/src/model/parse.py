@@ -1,6 +1,7 @@
 from .spec import ModelSpec
 from .cd_refine import (
     CDRefineModule,
+    NoisyDistributionRefineModule,
     NoisyAnchorScoreFieldRefineModule,
     TangentialCDRefineModule,
 )
@@ -15,6 +16,7 @@ def get_model(model_config, **kwargs) -> ModelSpec:
     MAP = {
         'CDRefineModule': CDRefineModule,
         'DirectionDistanceVelocityModule': DirectionDistanceVelocityModule,
+        'NoisyDistributionRefineModule': NoisyDistributionRefineModule,
         'NoisyAnchorScoreFieldRefineModule': NoisyAnchorScoreFieldRefineModule,
         'StraightPCFCoupledVelocityModule': StraightPCFCoupledVelocityModule,
         'StraightPCFVelocityDistanceModule': StraightPCFVelocityDistanceModule,

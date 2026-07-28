@@ -1495,6 +1495,154 @@ class TangentSpreadRefineModule(ModelSpec):
         return res
 
 
+class NoisyDistributionRefineModule(TangentSpreadRefineModule):
+    """
+    Lightweight CDRefine driven by noisy-set distribution cues.
+
+    Unlike the score-field refine stage, this module does not require clean
+    points for training. It conditions the residual predictor on noisy-derived
+    local density, tangent residual, and edge-risk proxies, then uses the
+    distribution losses from TangentSpreadRefineModule to spread only crowded
+    regions while keeping movement small and mostly tangent to stage-1.
+    """
+
+    def __init__(self, model_config, transform_config):
+        cfg = deepcopy(model_config)
+        cfg.setdefault("reference_field", "pc_noisy")
+        cfg.setdefault("delta_scale", 0.018)
+        cfg.setdefault("force_delta_scale", 0.014)
+        cfg.setdefault("spread_k", 12)
+        cfg.setdefault("mid_spread_k", 48)
+        cfg.setdefault("mid_force_weight", 0.35)
+        cfg.setdefault("repulsion_k", 16)
+        cfg.setdefault("dense_power", 1.2)
+        cfg.setdefault("density_gate_floor", 0.05)
+        cfg.setdefault("density_gate_power", 0.8)
+        cfg.setdefault("force_loss_weight", 0.35)
+        cfg.setdefault("repulsion_loss_weight", 0.75)
+        cfg.setdefault("spacing_loss_weight", 0.35)
+        cfg.setdefault("normal_delta_weight", 0.45)
+        cfg.setdefault("anchor_loss_weight", 0.035)
+        cfg.setdefault("reference_overexpand_weight", 0.12)
+        cfg.setdefault("reference_upper_scale", 1.35)
+        cfg.setdefault("surface_bank_guard_weight", 0.0)
+        cfg.setdefault("project_delta_to_tangent", True)
+        super().__init__(cfg, transform_config)
+
+        self.noisy_context_k = cfg.get("noisy_context_k", cfg.get("context_feature_k", self.spread_k))
+        self.noisy_geometry_k = cfg.get("noisy_geometry_k", self.noisy_context_k)
+        self.noisy_context_dim = 14
+        self.encoder = FeatureExtraction(
+            k=self.frame_knn,
+            input_dim=self.noisy_context_dim,
+            embedding_dim=self.feat_embedding_dim,
+            distance_estimation=cfg.get("normalize_features", True),
+        )
+        self.decoder = Decoder(
+            z_dim=self.encoder.embedding_dim,
+            dim=3,
+            out_dim=3,
+            hidden_size=self.decoder_hidden_dim,
+        )
+
+    def _noisy_distribution_features(self, pc_stage1, pc_reference, normal):
+        B, N, _ = pc_stage1.shape
+        zero = jt.zeros((B, N, 1))
+        zero_vec = jt.zeros_like(pc_stage1)
+
+        stage_spacing, _, _ = _local_spacing(pc_stage1, self.noisy_context_k)
+        if stage_spacing is None:
+            stage_spacing = jt.ones((B, N)) * 1e-3
+
+        if pc_reference is None:
+            residual_tan = zero_vec
+            residual_norm = zero
+            residual_normal_abs = zero
+            reference_spacing = stage_spacing
+            noisy_risk = zero
+        else:
+            residual = pc_reference - pc_stage1
+            residual_tan, residual_normal = _project_to_tangent(residual, normal)
+            residual_norm = jt.sqrt((residual_tan ** 2.0).sum(dim=-1, keepdims=True) + 1e-12)
+            residual_normal_abs = jt.abs(residual_normal)
+
+            reference_spacing, _, _ = _local_spacing(pc_reference, self.noisy_context_k)
+            if reference_spacing is None:
+                reference_spacing = stage_spacing
+
+            noisy_neighbors = _knn_neighbors(pc_reference, self.noisy_geometry_k)
+            if noisy_neighbors is None:
+                noisy_risk = zero
+            else:
+                noisy_risk = _radius_risk_from_neighbors(pc_reference, noisy_neighbors)
+
+        stage_spacing_u = stage_spacing.unsqueeze(-1)
+        reference_spacing_u = reference_spacing.unsqueeze(-1)
+        spacing_ratio = stage_spacing_u / (reference_spacing_u + 1e-8)
+        dense = jt.maximum(
+            (reference_spacing_u * float(self.reference_spacing_scale) - stage_spacing_u) /
+            (reference_spacing_u + 1e-8),
+            jt.zeros_like(stage_spacing_u),
+        )
+        sparse = jt.maximum(
+            (stage_spacing_u - reference_spacing_u * float(self.reference_upper_scale)) /
+            (reference_spacing_u + 1e-8),
+            jt.zeros_like(stage_spacing_u),
+        )
+
+        return jt.concat(
+            [
+                pc_stage1,
+                residual_tan,
+                residual_norm,
+                residual_normal_abs,
+                stage_spacing_u,
+                reference_spacing_u,
+                spacing_ratio,
+                dense,
+                sparse,
+                noisy_risk,
+            ],
+            dim=-1,
+        )
+
+    def _predict_delta(self, pc_stage1, normal=None, pc_reference=None):
+        B, N, d = pc_stage1.shape
+        if normal is None:
+            normal = self._normal_proxy(pc_stage1)
+        feat_input = self._noisy_distribution_features(
+            pc_stage1,
+            pc_reference,
+            normal,
+        )
+        feat = self.encoder(feat_input)
+        F_dim = feat.shape[-1]
+        raw_delta = self.decoder(c=feat.reshape(-1, F_dim)).reshape(B, N, d)
+        return float(self.delta_scale) * jt.tanh(raw_delta)
+
+    def refine(self, pc_stage1, pc_normal_proxy=None, pc_reference=None):
+        normal = self._normal_proxy(pc_stage1, pc_normal_proxy=pc_normal_proxy)
+        raw_delta = self._predict_delta(
+            pc_stage1,
+            normal=normal,
+            pc_reference=pc_reference,
+        )
+        if self.project_delta_to_tangent:
+            delta, normal_dot = _project_to_tangent(raw_delta, normal)
+        else:
+            delta = raw_delta
+            normal_dot = (raw_delta * normal).sum(dim=-1, keepdims=True)
+        density_gate = self._density_gate(
+            pc_stage1,
+            normal,
+            pc_reference=pc_reference,
+        )
+        if density_gate is not None:
+            delta = delta * density_gate
+            normal_dot = normal_dot * density_gate
+        return pc_stage1 + delta, delta, raw_delta, normal, normal_dot
+
+
 class ScoreFieldRefineModule(TangentSpreadRefineModule):
     """
     Query-conditioned score-field refinement.
